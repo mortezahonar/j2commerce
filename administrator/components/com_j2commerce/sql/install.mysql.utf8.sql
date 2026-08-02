@@ -846,6 +846,7 @@ CREATE TABLE IF NOT EXISTS `#__j2commerce_orders` (
   `customer_language` varchar(255) NOT NULL,
   `customer_group` varchar(255) NOT NULL,
   `order_state_id` int NOT NULL,
+  `stock_committed` tinyint(1) NOT NULL DEFAULT '0' COMMENT 'Whether this order currently holds deducted stock',
   `order_state` varchar(255) NOT NULL COMMENT 'Legacy compatibility',
   `order_params` text DEFAULT NULL,
   `access` int UNSIGNED NOT NULL DEFAULT '0',
@@ -1320,6 +1321,7 @@ CREATE TABLE IF NOT EXISTS `#__j2commerce_uploads` (
   `saved_name` varchar(255) NOT NULL,
   `mime_type` varchar(255) NOT NULL,
   `file_size` bigint NOT NULL DEFAULT 0,
+  `client_ip` varchar(64) NOT NULL DEFAULT '' COMMENT 'Salted SHA-256 throttle key — u: user id, i: client IP; not reversible',
   `created_by` int NOT NULL,
   `created_on` datetime NOT NULL,
   `expires_on` datetime NULL DEFAULT NULL,
@@ -1329,7 +1331,8 @@ CREATE TABLE IF NOT EXISTS `#__j2commerce_uploads` (
   KEY `idx_cart_id` (`cart_id`),
   KEY `idx_status` (`status`),
   KEY `idx_attribute_type` (`attribute_type`),
-  KEY `idx_expires_on` (`expires_on`)
+  KEY `idx_expires_on` (`expires_on`),
+  KEY `idx_client_ip` (`client_ip`, `created_on`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- --------------------------------------------------------

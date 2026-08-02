@@ -86,6 +86,10 @@ class HtmlView extends BaseHtmlView
         $model  = $this->getModel();
         $userId = $this->user ? (int) $this->user->id : 0;
 
+        if ($layout === 'packingslip' && !$this->params->get('show_packingslip', 0)) {
+            throw new \Exception(Text::_('JERROR_PAGE_NOT_FOUND'), 404);
+        }
+
         if ($layout === 'order' || $layout === 'packingslip') {
             $orderId     = $app->getInput()->getString('order_id', '');
             $this->order = $model->getOrder($orderId);
@@ -140,7 +144,7 @@ class HtmlView extends BaseHtmlView
 
             // Load downloads if enabled
             if ($this->params->get('download_area', 1)) {
-                $downloadData         = $model->getDownloads($userId, $guestEmail, 0, $limit);
+                $downloadData         = $model->getDownloads($userId, $guestEmail, 0, $limit, '', (string) $guestToken);
                 $this->downloads      = $downloadData['downloads'];
                 $this->downloadsTotal = $downloadData['total'];
             }
@@ -182,7 +186,21 @@ class HtmlView extends BaseHtmlView
 
         // Register JS
         $wa = $this->getDocument()->getWebAssetManager();
-        $wa->registerAndUseScript('com_j2commerce.myprofile', 'media/com_j2commerce/js/site/myprofile.js', [], ['defer' => true]);
+        $wa->registerAndUseScript('com_j2commerce.dom', 'media/com_j2commerce/js/site/j2commerce-dom.js', [], ['defer' => true]);
+        $wa->registerAndUseScript(
+            'com_j2commerce.countryzone',
+            'media/com_j2commerce/js/site/j2commerce-countryzone.js',
+            [],
+            ['defer' => true],
+            ['com_j2commerce.dom']
+        );
+        $wa->registerAndUseScript(
+            'com_j2commerce.myprofile',
+            'media/com_j2commerce/js/site/myprofile.js',
+            [],
+            ['defer' => true],
+            ['com_j2commerce.countryzone']
+        );
 
         // Register payment methods JS if unified tab is active
         if ($this->useUnifiedPaymentTab) {

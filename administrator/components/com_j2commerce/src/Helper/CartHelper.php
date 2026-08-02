@@ -596,9 +596,9 @@ class CartHelper
     {
         $db = self::getDatabase();
 
-        // Load order to get cart_id
+        // Load order to get cart_id and user_id
         $query = $db->getQuery(true)
-            ->select($db->quoteName(['j2commerce_order_id', 'cart_id']))
+            ->select($db->quoteName(['j2commerce_order_id', 'cart_id', 'user_id']))
             ->from($db->quoteName('#__j2commerce_orders'))
             ->where($db->quoteName('order_id') . ' = :orderId')
             ->bind(':orderId', $orderId);
@@ -611,6 +611,7 @@ class CartHelper
         }
 
         $cartId = (int) $order->cart_id;
+        $userId = (int) ($order->user_id ?? 0);
 
         // Trigger plugin event before emptying cart
         // TODO: Implement plugin events when J2Commerce plugin system is ready
@@ -633,6 +634,38 @@ class CartHelper
 
         $db->setQuery($deleteCart);
         $db->execute();
+
+        // For logged-in users, also purge any other stale 'cart'-type carts that can
+        // accumulate from guest→login migration edge-cases.  A user should have at most
+        // one active cart; leftover secondary carts would otherwise surface as "ghost"
+        // items on the next getCart() call.
+        if ($userId > 0) {
+            $otherCartQuery = $db->getQuery(true)
+                ->select($db->quoteName('j2commerce_cart_id'))
+                ->from($db->quoteName('#__j2commerce_carts'))
+                ->where($db->quoteName('user_id') . ' = :userId')
+                ->where($db->quoteName('cart_type') . ' = ' . $db->quote('cart'))
+                ->bind(':userId', $userId, ParameterType::INTEGER);
+
+            $db->setQuery($otherCartQuery);
+            $otherCartIds = array_map('intval', $db->loadColumn() ?: []);
+
+            if (!empty($otherCartIds)) {
+                $db->setQuery(
+                    $db->getQuery(true)
+                        ->delete($db->quoteName('#__j2commerce_cartitems'))
+                        ->whereIn($db->quoteName('cart_id'), $otherCartIds)
+                );
+                $db->execute();
+
+                $db->setQuery(
+                    $db->getQuery(true)
+                        ->delete($db->quoteName('#__j2commerce_carts'))
+                        ->whereIn($db->quoteName('j2commerce_cart_id'), $otherCartIds)
+                );
+                $db->execute();
+            }
+        }
 
         // Clear cart cookie
         self::getInstance()->clearCartCookie();
@@ -1002,7 +1035,7 @@ class CartHelper
      * Load cart by cookie-stored cart ID.
      *
      * This is a fallback mechanism for guest users when their session changes.
-     * If the cart is found via cookie, we update its session_id to match the current session.
+     * The cookie value is an HMAC-signed `cartId.signature` pair; on a hit the cart's session_id is updated.
      *
      * @param   string  $cartType   Cart type.
      * @param   string  $sessionId  Current session ID to update the cart with.
@@ -1015,10 +1048,16 @@ class CartHelper
     {
         $app = Factory::getApplication();
 
-        // Get cart ID from cookie (cart-type-scoped name)
-        $cookieCartId = (int) $app->getInput()->cookie->getInt($this->getCartCookieName($cartType), 0);
+        // Get cart ID from signed cookie (cart-type-scoped name)
+        $rawCookie    = (string) $app->getInput()->cookie->getString($this->getCartCookieName($cartType), '');
+        $cookieCartId = $rawCookie !== '' ? $this->verifySignedCartId($rawCookie) : 0;
 
         if ($cookieCartId <= 0) {
+            if ($rawCookie !== '') {
+                // Unsigned legacy value or bad signature — do not honour it
+                $this->clearCartCookie($cartType);
+            }
+
             return null;
         }
 
@@ -1084,13 +1123,12 @@ class CartHelper
             return;
         }
 
-        $app        = Factory::getApplication();
-        $cookieName = $this->getCartCookieName($cartType);
+        $app         = Factory::getApplication();
+        $cookieName  = $this->getCartCookieName($cartType);
+        $signedValue = $this->signCartId($cartId);
 
         // Check if cookie already set with same value
-        $existingCartId = (int) $app->getInput()->cookie->getInt($cookieName, 0);
-
-        if ($existingCartId === $cartId) {
+        if ((string) $app->getInput()->cookie->getString($cookieName, '') === $signedValue) {
             return;
         }
 
@@ -1100,7 +1138,32 @@ class CartHelper
         $domain  = $app->get('cookie_domain', '');
         $secure  = $app->isHttpsForced();
 
-        setcookie($cookieName, (string) $cartId, $expires, $path, $domain, $secure, true);
+        setcookie($cookieName, $signedValue, $expires, $path, $domain, $secure, true);
+    }
+
+    /**
+     * Produce the signed cookie payload for a cart ID.
+     */
+    private function signCartId(int $cartId): string
+    {
+        $secret = (string) Factory::getApplication()->get('secret', '');
+
+        return $cartId . '.' . hash_hmac('sha256', (string) $cartId, $secret);
+    }
+
+    /**
+     * Extract the cart ID from a signed cookie payload, or 0 when invalid.
+     */
+    private function verifySignedCartId(string $raw): int
+    {
+        if (!preg_match('/^(\d+)\.([0-9a-f]{64})$/', $raw, $m)) {
+            return 0;
+        }
+
+        $secret   = (string) Factory::getApplication()->get('secret', '');
+        $expected = hash_hmac('sha256', $m[1], $secret);
+
+        return hash_equals($expected, $m[2]) ? (int) $m[1] : 0;
     }
 
     /**

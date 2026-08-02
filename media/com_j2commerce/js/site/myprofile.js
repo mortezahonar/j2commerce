@@ -13,7 +13,14 @@ document.addEventListener('DOMContentLoaded', () => {
     // Tab deep-linking via URL hash
     const hash = window.location.hash;
     if (hash) {
-        const btn = document.querySelector(`[data-bs-target="${hash}"]`);
+        // Compare in JS rather than interpolating the hash into a selector: a URL ending in
+        // #a"] makes querySelector throw, which would abort this whole handler and unbind
+        // every listener in the file. Restricted to tab toggles for the same reason — show()
+        // resolves siblings through the element's .nav / .list-group / [role=tablist] ancestor
+        // and fails without one, which a navbar toggler or collapse button would not have.
+        const btn = Array.from(document.querySelectorAll('[data-bs-toggle="tab"][data-bs-target]'))
+            .find(el => el.dataset.bsTarget === hash);
+
         if (btn) {
             new bootstrap.Tab(btn).show();
         }
@@ -32,15 +39,24 @@ document.addEventListener('DOMContentLoaded', () => {
     let searchTimer   = null;
     let currentPage   = 0;
 
+    // textContent → innerHTML is TEXT-node serialisation: it leaves " and ' intact, and every
+    // call site below interpolates into a quoted attribute. Escape the full ENT_QUOTES set so
+    // a stored value such as a status CSS class cannot close the attribute and add a handler.
+    const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
+
     function escapeHtml(str) {
-        const el = document.createElement('span');
-        el.textContent = str;
-        return el.innerHTML;
+        return String(str ?? '').replace(/[&<>"']/g, ch => HTML_ESCAPES[ch]);
     }
 
     // Parse server-rendered HTML into an inert fragment (no innerHTML sink) for adoption.
+    // createContextualFragment unmarks parsed scripts as "already started", so unlike the
+    // innerHTML assignment this replaced they WOULD run on insertion. Drop them to keep
+    // the original semantics — plugin markup renders, it does not execute.
     function parseFragment(html) {
-        return document.createRange().createContextualFragment(html || '');
+        const frag = document.createRange().createContextualFragment(html || '');
+        frag.querySelectorAll('script').forEach(s => s.remove());
+
+        return frag;
     }
 
     // Capture the initial server-rendered HTML structure so AJAX rebuilds
@@ -105,7 +121,6 @@ document.addEventListener('DOMContentLoaded', () => {
                     + '<td class="text-center text-nowrap">'
                     +   `<a href="${escapeHtml(o.view_url)}" class="btn btn-sm btn-outline-primary" title="${Joomla.Text._('COM_J2COMMERCE_ORDER_VIEW')}"><span class="icon-eye" aria-hidden="true"></span></a> `
                     +   `<button type="button" class="btn btn-sm btn-outline-secondary j2commerce-order-print" data-url="${escapeHtml(o.print_url)}" title="${Joomla.Text._('COM_J2COMMERCE_ORDER_PRINT')}"><span class="icon-print" aria-hidden="true"></span></button>`
-                    +   (o.after_display_html || '')
                     + '</td></tr>';
             }
 
@@ -116,7 +131,7 @@ document.addEventListener('DOMContentLoaded', () => {
             let pagHtml = '';
 
             if (pages > 1) {
-                pagHtml += `<nav aria-label="${Joomla.Text._('JLIB_HTML_PAGINATION')}"><ul class="${snapshotPagUlClass}" id="j2c-pagination-list">`;
+                pagHtml += `<nav aria-label="${Joomla.Text._('JLIB_HTML_PAGINATION')}"><ul class="${escapeHtml(snapshotPagUlClass)}" id="j2c-pagination-list">`;
                 for (let p = 0; p < pages; p++) {
                     const active = (p === page) ? ' active' : '';
                     pagHtml += `<li class="page-item${active}"><a class="page-link j2c-page-link" href="#" data-page="${p}">${p + 1}</a></li>`;
@@ -144,6 +159,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 + pagHtml
                 + `<span class="${escapeHtml(snapshotCountClass)}" id="j2c-orders-count">${countText}</span>`
                 + '</div>'));
+
+            // AfterDisplayOrder markup is plugin-owned: insert it as its own fragment, not into the row string.
+            const actionCells = wrap.querySelectorAll('#j2c-orders-body > tr > td:last-child');
+            orders.forEach((o, i) => {
+                if (o.after_display_html && actionCells[i]) {
+                    actionCells[i].appendChild(parseFragment(o.after_display_html));
+                }
+            });
 
             currentPage = page;
         } catch (err) {
@@ -286,7 +309,7 @@ document.addEventListener('DOMContentLoaded', () => {
             let pagHtml = '';
 
             if (pages > 1) {
-                pagHtml += `<nav aria-label="${Joomla.Text._('JLIB_HTML_PAGINATION')}"><ul class="${dlSnapshotPagUlClass}" id="j2c-downloads-pagination-list">`;
+                pagHtml += `<nav aria-label="${Joomla.Text._('JLIB_HTML_PAGINATION')}"><ul class="${escapeHtml(dlSnapshotPagUlClass)}" id="j2c-downloads-pagination-list">`;
                 for (let p = 0; p < pages; p++) {
                     const active = (p === page) ? ' active' : '';
                     pagHtml += `<li class="page-item${active}"><a class="page-link j2c-download-page-link" href="#" data-page="${p}">${p + 1}</a></li>`;
@@ -423,73 +446,10 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // Country → Zone cascading dropdowns (shared AJAX endpoints with checkout)
-    function initCountryZoneFields(formEl) {
-        if (!formEl) return;
-        const countrySelect = formEl.querySelector('select[name="country_id"]');
-        const zoneSelect = formEl.querySelector('select[name="zone_id"]');
-        if (!countrySelect) return;
-
-        const savedCountryId = formEl.dataset.countryId || '';
-        const savedZoneId = formEl.dataset.zoneId || '';
-
-        // Fetch and populate countries, restoring saved selection
-        let countryUrl = baseUrl + sep + 'task=ajax.getCountries';
-        if (savedCountryId && savedCountryId !== '0') {
-            countryUrl += '&country_id=' + encodeURIComponent(savedCountryId);
-        }
-
-        fetch(countryUrl)
-            .then(r => r.text())
-            .then(html => {
-                countrySelect.replaceChildren(parseFragment(html));
-                // If a country was pre-selected, cascade to load zones
-                if (countrySelect.value && zoneSelect) {
-                    loadZones(countrySelect.value, savedZoneId);
-                }
-            })
-            .catch(err => console.error('Error loading countries:', err));
-
-        if (!zoneSelect) return;
-
-        function loadZones(countryId, selectedZoneId) {
-            zoneSelect.replaceChildren(new Option('...', ''));
-            zoneSelect.disabled = true;
-
-            if (!countryId || countryId === '0' || countryId === '') {
-                zoneSelect.replaceChildren(new Option(Joomla.Text._('COM_J2COMMERCE_SELECT_ZONE'), ''));
-                zoneSelect.disabled = false;
-                return;
-            }
-
-            let url = baseUrl + sep + 'task=ajax.getZones&country_id=' + encodeURIComponent(countryId);
-            if (selectedZoneId && selectedZoneId !== '0') {
-                url += '&zone_id=' + encodeURIComponent(selectedZoneId);
-            }
-
-            fetch(url)
-                .then(r => r.text())
-                .then(html => {
-                    zoneSelect.replaceChildren(parseFragment(html));
-                    zoneSelect.disabled = false;
-                })
-                .catch(err => {
-                    console.error('Error loading zones:', err);
-                    zoneSelect.replaceChildren(new Option(Joomla.Text._('COM_J2COMMERCE_SELECT_ZONE'), ''));
-                    zoneSelect.disabled = false;
-                });
-        }
-
-        // Country change → reload zones
-        countrySelect.addEventListener('change', () => {
-            loadZones(countrySelect.value, '');
-        });
-    }
-
-    // Initialize country/zone fields if address form is present
+    // Country → Zone cascading dropdowns — shared with the registration form and checkout
     const addressForm = document.getElementById('j2commerce-address-form');
     if (addressForm) {
-        initCountryZoneFields(addressForm);
+        J2CommerceCountryZone.init(addressForm, { baseUrl });
     }
 
     // Address type change → reload page with correct custom fields for the area
@@ -522,14 +482,41 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // Print order button → open in Bootstrap modal
+    // Print order button → open in the modal the active template family rendered
     const orderModalEl = document.getElementById('j2commerceOrderModal');
     const orderModalBody = document.getElementById('j2commerceOrderModalBody');
     const orderPrintBtn = document.getElementById('j2commerceOrderPrintBtn');
     let orderModal = null;
 
+    // The uikit templates render `<div uk-modal>`, which the Bootstrap modal API cannot present.
+    // UIkit's JS ships with the site template, not with J2Commerce, so fall back to Bootstrap
+    // when the global is absent rather than leaving the button dead.
+    const isUikitModal = !!orderModalEl
+        && orderModalEl.hasAttribute('uk-modal')
+        && typeof UIkit !== 'undefined';
+
+    /** Spinner and alert markup differ per family; Bootstrap classes render as nothing in UIkit. */
+    function frameworkHtml(kind, message) {
+        if (kind === 'spinner') {
+            return isUikitModal
+                ? `<div class="uk-text-center uk-padding"><span uk-spinner="ratio: 2" role="status" aria-label="${message}"></span></div>`
+                : `<div class="text-center py-5"><div class="spinner-border" role="status"><span class="visually-hidden">${message}</span></div></div>`;
+        }
+
+        return isUikitModal
+            ? `<div class="uk-alert-danger" uk-alert>${message}</div>`
+            : `<div class="alert alert-danger">${message}</div>`;
+    }
+
     if (orderModalEl) {
-        orderModal = bootstrap.Modal.getOrCreateInstance(orderModalEl);
+        orderModal = isUikitModal
+            ? { show: () => UIkit.modal(orderModalEl).show() }
+            : bootstrap.Modal.getOrCreateInstance(orderModalEl);
+
+        // Do not leave the previous order or slip in the DOM after the modal closes.
+        orderModalEl.addEventListener(isUikitModal ? 'hidden' : 'hidden.bs.modal', () => {
+            if (orderModalBody) orderModalBody.replaceChildren();
+        });
     }
 
     document.addEventListener('click', async e => {
@@ -541,7 +528,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!url || !orderModal || !orderModalBody) return;
 
         // Show modal with spinner
-        orderModalBody.replaceChildren(document.createRange().createContextualFragment('<div class="text-center py-5"><div class="spinner-border" role="status"><span class="visually-hidden">' + Joomla.Text._("COM_J2COMMERCE_LOADING") + '</span></div></div>'));
+        orderModalBody.replaceChildren(parseFragment(frameworkHtml('spinner', Joomla.Text._('COM_J2COMMERCE_LOADING'))));
         orderModal.show();
 
         try {
@@ -556,7 +543,7 @@ document.addEventListener('DOMContentLoaded', () => {
             orderModalBody.replaceChildren(...content.childNodes);
         } catch (err) {
             console.error('Error loading order:', err);
-            orderModalBody.replaceChildren(document.createRange().createContextualFragment('<div class="alert alert-danger">Error loading order details.</div>'));
+            orderModalBody.replaceChildren(parseFragment(frameworkHtml('error', 'Error loading order details.')));
         }
     });
 
@@ -569,7 +556,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const url = btn.dataset.url || btn.getAttribute('href');
         if (!url || !orderModal || !orderModalBody) return;
 
-        orderModalBody.replaceChildren(document.createRange().createContextualFragment('<div class="text-center py-5"><div class="spinner-border" role="status"><span class="visually-hidden">' + Joomla.Text._("COM_J2COMMERCE_LOADING") + '</span></div></div>'));
+        orderModalBody.replaceChildren(parseFragment(frameworkHtml('spinner', Joomla.Text._('COM_J2COMMERCE_LOADING'))));
         orderModal.show();
 
         try {
@@ -582,7 +569,7 @@ document.addEventListener('DOMContentLoaded', () => {
             orderModalBody.replaceChildren(...content.childNodes);
         } catch (err) {
             console.error('Error loading packing slip:', err);
-            orderModalBody.replaceChildren(document.createRange().createContextualFragment('<div class="alert alert-danger">Error loading packing slip.</div>'));
+            orderModalBody.replaceChildren(parseFragment(frameworkHtml('error', 'Error loading packing slip.')));
         }
     });
 
@@ -590,15 +577,61 @@ document.addEventListener('DOMContentLoaded', () => {
     if (orderPrintBtn) {
         orderPrintBtn.addEventListener('click', () => {
             if (!orderModalBody) return;
-            const printWindow = window.open('', '_blank', 'width=800,height=600');
-            if (printWindow) {
-                printWindow.document.write(`<!DOCTYPE html><html><head><title>Order</title>
-                    <link rel="stylesheet" href="${document.querySelector('link[href*="bootstrap"]')?.href || ''}">
-                    <style>body{padding:20px;font-family:sans-serif}@media print{.no-print{display:none}}</style>
-                    </head><body>${orderModalBody.innerHTML}
-                    <script>window.onload=function(){window.print();window.close()}<\/script>
-                    </body></html>`);
-                printWindow.document.close();
+
+            const printWindow = window.open('about:blank', '_blank', 'width=800,height=600');
+            if (!printWindow) return;
+
+            const printDoc = printWindow.document;
+
+            const title = printDoc.createElement('title');
+            title.textContent = document.title;
+            printDoc.head.appendChild(title);
+
+            // Carry the storefront's framework stylesheet into the popup so the printed
+            // markup keeps its layout — uikit storefronts ship no bootstrap link.
+            const frameworkHref = document.querySelector('link[href*="bootstrap"], link[href*="uikit"]')?.href || '';
+            let stylesheet = null;
+
+            if (frameworkHref) {
+                stylesheet = printDoc.createElement('link');
+                stylesheet.rel = 'stylesheet';
+                stylesheet.href = frameworkHref;
+                printDoc.head.appendChild(stylesheet);
+            }
+
+            const style = printDoc.createElement('style');
+            style.textContent = 'body{padding:20px;font-family:sans-serif}@media print{.no-print{display:none}}';
+            printDoc.head.appendChild(style);
+
+            const fragment = printDoc.createDocumentFragment();
+            Array.from(orderModalBody.childNodes).forEach(node => {
+                // Packing slip CSS travels inert so it cannot restyle the storefront; it only
+                // becomes a stylesheet here, in the print document.
+                if (node.nodeType === Node.ELEMENT_NODE && node.matches('template.j2commerce-packingslip-css')) {
+                    printDoc.head.appendChild(printDoc.importNode(node.content, true));
+                    return;
+                }
+
+                fragment.appendChild(printDoc.importNode(node, true));
+            });
+            printDoc.body.appendChild(fragment);
+
+            let printed = false;
+            const startPrint = () => {
+                if (printed) return;
+                printed = true;
+                printWindow.focus();
+                printWindow.print();
+                printWindow.close();
+            };
+
+            if (stylesheet) {
+                stylesheet.addEventListener('load', startPrint);
+                stylesheet.addEventListener('error', startPrint);
+                // Fallback in case the stylesheet never resolves.
+                window.setTimeout(startPrint, 1500);
+            } else {
+                window.setTimeout(startPrint, 0);
             }
         });
     }

@@ -661,10 +661,14 @@ class OrderModel extends AdminModel
         return $newStock;
     }
 
-    /** Order statuses where stock has already been committed (Confirmed / Pending). */
+    /** Does this order currently hold deducted stock? */
     public function isStockCommitted(object $order): bool
     {
-        return \in_array((int) ($order->order_state_id ?? 0), [1, 4], true);
+        if (isset($order->stock_committed)) {
+            return (int) $order->stock_committed === 1;
+        }
+
+        return InventoryHelper::orderStockCommitted((string) ($order->order_id ?? ''));
     }
 
     /** Supplemental-charge capability of the order's gateway ('token_charge' | 'order_update' | 'none'). */
@@ -1041,7 +1045,14 @@ class OrderModel extends AdminModel
             return false;
         }
 
-        // Update order status
+        // Compare-and-swap on the status read above: the write only lands while the order
+        // still holds it. Without the predicate two writers handling the same order — a
+        // webhook redelivery alongside an admin save, or two passes of the hold_stock
+        // sweep — both pass the change check above and both run every side effect below,
+        // appending a second history row, firing the status event twice and re-granting
+        // downloads. Zero affected rows means someone else moved the order first, which is
+        // a completed transition rather than a failure, so it reports success and does no
+        // further work.
         $updateQuery = $db->getQuery(true)
             ->update($db->quoteName('#__j2commerce_orders'))
             ->set($db->quoteName('order_state_id') . ' = :newStatusId')
@@ -1049,11 +1060,13 @@ class OrderModel extends AdminModel
             ->set($db->quoteName('modified_on') . ' = :now')
             ->set($db->quoteName('modified_by') . ' = :userId')
             ->where($db->quoteName('j2commerce_order_id') . ' = :orderId')
+            ->where($db->quoteName('order_state_id') . ' = :oldStatusId')
             ->bind(':newStatusId', $newStatusId, ParameterType::INTEGER)
             ->bind(':stateName', $status->orderstatus_name)
             ->bind(':now', $now)
             ->bind(':userId', $userId, ParameterType::INTEGER)
-            ->bind(':orderId', $orderId, ParameterType::INTEGER);
+            ->bind(':orderId', $orderId, ParameterType::INTEGER)
+            ->bind(':oldStatusId', $oldStatusId, ParameterType::INTEGER);
 
         $db->setQuery($updateQuery);
 
@@ -1061,6 +1074,16 @@ class OrderModel extends AdminModel
             $this->setError($db->getErrorMsg());
             return false;
         }
+
+        if ($db->getAffectedRows() !== 1) {
+            return true;
+        }
+
+        // Inventory. This model writes order_state_id directly rather than through
+        // OrderTable::store(), so without this call every status change made here —
+        // the admin dropdown, the bulk action, the hold_stock sweep and the shipping
+        // plugins — moved the order but left stock untouched in both directions.
+        InventoryHelper::applyStatusTransition($order->order_id, $newStatusId);
 
         // Add history entry with status change comment if none provided
         $historyComment = $comment;

@@ -68,6 +68,10 @@ class OrderTable extends Table
             $this->order_state_id = 5;
         }
 
+        if (!isset($this->stock_committed) || $this->stock_committed === '') {
+            $this->stock_committed = 0;
+        }
+
         // Validate user email
         if (empty($this->user_email)) {
             $this->setError(Text::sprintf('COM_J2COMMERCE_ERR_FIELD_REQUIRED', Text::_('COM_J2COMMERCE_FIELD_EMAIL')));
@@ -121,6 +125,15 @@ class OrderTable extends Table
             }
         }
 
+        // Shipping charges and the grand total must be zero or positive.
+        foreach (['order_shipping', 'order_shipping_tax', 'order_total'] as $moneyField) {
+            if (round((float) $this->$moneyField, 5) < 0) {
+                $this->setError(Text::sprintf('COM_J2COMMERCE_ERR_FIELD_INVALID', $moneyField));
+
+                return false;
+            }
+        }
+
         return true;
     }
 
@@ -145,7 +158,9 @@ class OrderTable extends Table
         $this->modified_by = (int) $user->id;
 
         // Capture old status before storing (for new records, treat as status change from 5=Incomplete)
-        $oldStatusId = null;
+        $oldStatusId   = null;
+        $newStatusId   = (int) $this->order_state_id;
+        $statusClaimed = true;
 
         if (!$isNew) {
             $db    = $this->getDatabase();
@@ -156,21 +171,61 @@ class OrderTable extends Table
                 ->bind(':id', $this->j2commerce_order_id, \Joomla\Database\ParameterType::INTEGER);
             $db->setQuery($query);
             $oldStatusId = (int) $db->loadResult();
+
+            // Claim the transition against the status just read, so only one writer runs
+            // the side effects below. Two writers on the same order otherwise both see the
+            // same old status, both clear the change check, and both append history, fire
+            // the status event and re-grant downloads.
+            if ($oldStatusId !== $newStatusId) {
+                $statusClaimed = $this->claimStatusTransition($oldStatusId, $newStatusId);
+            }
+        }
+
+        // stock_committed is owned by InventoryHelper's compare-and-set, never by the row
+        // write. Table::store() persists every non-null property, so a writer holding a row
+        // loaded before the flag was set would put its stale value back and the claim below
+        // would then succeed against that — debiting the same order twice. Unsetting keeps
+        // the column out of the statement entirely; a new row takes the column default.
+        $committedProperty = $this->stock_committed ?? null;
+        unset($this->stock_committed);
+
+        // A won claim already wrote the status. A lost one means another writer moved the
+        // order in between, so the status columns are kept out of this statement as well:
+        // persisting them would move the order back onto a transition it no longer holds,
+        // leaving the row disagreeing with the stock the winner committed against it.
+        $stateProperties = null;
+
+        if (!$statusClaimed) {
+            $stateProperties = [$this->order_state_id, $this->order_state ?? null];
+            unset($this->order_state_id, $this->order_state);
         }
 
         // Perform the actual store
         $result = parent::store($updateNulls);
 
+        $this->stock_committed = $committedProperty ?? 0;
+
+        if ($stateProperties !== null) {
+            [$this->order_state_id, $this->order_state] = $stateProperties;
+        }
+
         if (!$result) {
             return false;
         }
 
-        // After successful store, handle status-based side effects
-        $newStatusId = (int) $this->order_state_id;
-
-        // Skip if status didn't change (and not a new record)
-        if (!$isNew && $oldStatusId === $newStatusId) {
+        // Skip if status didn't change (and not a new record), or if another writer owns
+        // this transition
+        if (!$isNew && ($oldStatusId === $newStatusId || !$statusClaimed)) {
             return true;
+        }
+
+        // Move the stock before announcing the change, matching OrderModel::updateOrderStatus().
+        // A listener that reads variant quantities inside the event otherwise gets a different
+        // answer depending on which writer fired for the same logical transition.
+        $committed = InventoryHelper::applyStatusTransition($this->order_id, $newStatusId);
+
+        if ($committed !== null) {
+            $this->stock_committed = $committed;
         }
 
         // Trigger plugin event for status change
@@ -180,21 +235,6 @@ class OrderTable extends Table
             $oldStatusId,
             $newStatusId,
         ]);
-
-        // Stock reduction on confirmation, restoration on cancellation
-        // Status 1 = Confirmed, Status 4 = Pending (stock already reduced), Status 6 = Cancelled
-        $confirmedStatuses = [1];
-        $cancelledStatuses = [6];
-
-        if (\in_array($newStatusId, $confirmedStatuses, true) && $oldStatusId !== 4) {
-            // Reduce stock when order is confirmed (skip if was Pending — already reduced)
-            InventoryHelper::reduceOrderStock($this->order_id);
-        } elseif (\in_array($newStatusId, $cancelledStatuses, true)
-            && $oldStatusId !== null
-            && !\in_array($oldStatusId, [5, 6], true)) {
-            // Restore stock when order is cancelled (skip if was Incomplete/5 or already Cancelled/6)
-            InventoryHelper::restoreOrderStock($this->order_id);
-        }
 
         // Grant download access when status changes to an allowed download status
         if (\in_array($newStatusId, ConfigHelper::getDownloadAllowedStatuses(), true)) {
@@ -219,6 +259,25 @@ class OrderTable extends Table
         );
 
         return true;
+    }
+
+    /** Compare-and-swap: true only for the writer whose read of the old status still held. */
+    private function claimStatusTransition(int $oldStatusId, int $newStatusId): bool
+    {
+        $db    = $this->getDatabase();
+        $query = $db->getQuery(true)
+            ->update($db->quoteName('#__j2commerce_orders'))
+            ->set($db->quoteName('order_state_id') . ' = :newStatusId')
+            ->where($db->quoteName('j2commerce_order_id') . ' = :id')
+            ->where($db->quoteName('order_state_id') . ' = :oldStatusId')
+            ->bind(':newStatusId', $newStatusId, \Joomla\Database\ParameterType::INTEGER)
+            ->bind(':id', $this->j2commerce_order_id, \Joomla\Database\ParameterType::INTEGER)
+            ->bind(':oldStatusId', $oldStatusId, \Joomla\Database\ParameterType::INTEGER);
+
+        $db->setQuery($query);
+        $db->execute();
+
+        return $db->getAffectedRows() === 1;
     }
 
     /**

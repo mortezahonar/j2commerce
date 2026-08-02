@@ -955,6 +955,120 @@ class InventoryHelper
     // =========================================================================
 
     /**
+     * Order statuses that do NOT hold stock: New (5) has not been placed against inventory
+     * yet, Cancelled (6) has given its units back, and Failed (3) is a dead end that nothing
+     * sweeps — holding there would strand the units on every declined card.
+     *
+     * @since   6.5.0
+     */
+    private const NON_HOLDING_STATUSES = [3, 5, 6];
+
+    /**
+     * Does an order in this status hold reserved stock?
+     *
+     * @since   6.5.0
+     */
+    public static function statusHoldsStock(int $statusId): bool
+    {
+        return !\in_array($statusId, self::NON_HOLDING_STATUSES, true);
+    }
+
+    /** Does this order currently hold deducted stock? */
+    public static function orderStockCommitted(string $orderId): bool
+    {
+        if ($orderId === '') {
+            return false;
+        }
+
+        $db    = self::getDatabase();
+        $query = $db->getQuery(true)
+            ->select($db->quoteName('stock_committed'))
+            ->from($db->quoteName('#__j2commerce_orders'))
+            ->where($db->quoteName('order_id') . ' = :orderId')
+            ->bind(':orderId', $orderId);
+
+        $db->setQuery($query);
+
+        return (int) $db->loadResult() === 1;
+    }
+
+    /**
+     * Claim the transition by flipping the flag, and report whether this caller won it.
+     *
+     * The conditional UPDATE is the lock. Two requests arriving together — a webhook
+     * delivered twice, or one racing the shopper's browser return — would otherwise both
+     * read the old value and both move the stock.
+     */
+    private static function claimStockCommitted(string $orderId, bool $committed): bool
+    {
+        $db   = self::getDatabase();
+        $to   = $committed ? 1 : 0;
+        $from = $committed ? 0 : 1;
+
+        $query = $db->getQuery(true)
+            ->update($db->quoteName('#__j2commerce_orders'))
+            ->set($db->quoteName('stock_committed') . ' = :to')
+            ->where($db->quoteName('order_id') . ' = :orderId')
+            ->where($db->quoteName('stock_committed') . ' = :from')
+            ->bind(':to', $to, ParameterType::INTEGER)
+            ->bind(':from', $from, ParameterType::INTEGER)
+            ->bind(':orderId', $orderId);
+
+        $db->setQuery($query);
+        $db->execute();
+
+        return $db->getAffectedRows() === 1;
+    }
+
+    /**
+     * Apply the inventory side of an order status transition.
+     *
+     * Driven by what the order actually did, not by where it has been: the prior status
+     * only ever described the rule in force when that status was written, and that rule
+     * has changed. stock_committed records the debit itself, so a status set the order
+     * never earned cannot produce a credit, and an order created in one pass at a holding
+     * status — with no items to debit yet — never claims one.
+     *
+     * @param   string  $orderId      The order_id string (NOT the PK).
+     * @param   int     $newStatusId  Status being written.
+     *
+     * @return  int|null  The new stock_committed value when it changed, otherwise null.
+     *
+     * @since   6.5.0
+     */
+    public static function applyStatusTransition(string $orderId, int $newStatusId): ?int
+    {
+        if ($orderId === '') {
+            return null;
+        }
+
+        if (self::statusHoldsStock($newStatusId)) {
+            // Claim before debiting, so a concurrent writer cannot debit the same order.
+            if (!self::claimStockCommitted($orderId, true)) {
+                return null;
+            }
+
+            // An order with no items yet — created in one pass at a holding status — has
+            // nothing to account for. Release the claim so it can never credit later.
+            if (!self::reduceOrderStock($orderId)) {
+                self::claimStockCommitted($orderId, false);
+
+                return null;
+            }
+
+            return 1;
+        }
+
+        if (!self::claimStockCommitted($orderId, false)) {
+            return null;
+        }
+
+        self::restoreOrderStock($orderId);
+
+        return 0;
+    }
+
+    /**
      * Reduce stock for all items in an order.
      *
      * Called when an order status changes to Confirmed (1).
@@ -966,17 +1080,18 @@ class InventoryHelper
      *
      * @since   6.0.10
      */
-    public static function reduceOrderStock(string $orderId): void
+    public static function reduceOrderStock(string $orderId): bool
     {
         if (empty($orderId)) {
-            return;
+            return false;
         }
 
         $items = self::loadOrderItemsWithVariants($orderId);
 
         if (empty($items)) {
-            return;
+            return false;
         }
+
 
         \Joomla\CMS\Plugin\PluginHelper::importPlugin('j2commerce');
 
@@ -998,7 +1113,7 @@ class InventoryHelper
             $allowBackorder = self::isBackorderAllowed($variant);
             $wasAlreadyZero = ($oldStock <= 0 && $allowBackorder);
 
-            $newStock = self::adjustVariantStock((int) $item->variant_id, -$qty, $allowBackorder);
+            $newStock = self::adjustVariantStock((int) $item->variant_id, -$qty);
 
             if ($newStock <= 0 && !$allowBackorder) {
                 self::setVariantAvailability((int) $item->variant_id, 0);
@@ -1022,6 +1137,10 @@ class InventoryHelper
 
             J2CommerceHelper::plugin()->event('AfterStockAdjust', [(int) $item->variant_id, $newStock]);
         }
+
+        // Items existed, so this order's stock is now accounted for — even if every line
+        // turned out to be unmanaged and nothing actually moved.
+        return true;
     }
 
     /**
@@ -1066,7 +1185,7 @@ class InventoryHelper
             $qty      = (int) $item->orderitem_quantity;
             $oldStock = self::getStockQuantity((int) $item->variant_id);
 
-            $newStock = self::adjustVariantStock((int) $item->variant_id, $qty, false);
+            $newStock = self::adjustVariantStock((int) $item->variant_id, $qty);
 
             if ($newStock > 0) {
                 self::setVariantAvailability((int) $item->variant_id, 1);
@@ -1149,21 +1268,26 @@ class InventoryHelper
      * Adjust variant stock quantity atomically.
      *
      * Uses atomic SQL update to prevent race conditions on concurrent orders.
-     * For reductions without backorders, stock is clamped at zero.
-     * For reductions with backorders, stock can go negative.
      *
      * @param   int   $variantId       The variant ID.
      * @param   int   $delta           Amount to adjust (negative to reduce).
-     * @param   bool  $allowNegative   Whether stock can go below zero (backorders).
+     * @param   bool  $allowNegative   Whether the variant may sell past zero (backorders).
      *
      * @return  int  The new stock quantity.
      *
      * @since   6.0.10
      */
-    /** Public entry point for single-variant stock adjustment (admin order editing). */
+    /**
+     * Public entry point for single-variant stock adjustment (admin order editing).
+     *
+     * $allowNegative no longer affects the stored value — stock is always recorded as the
+     * signed truth — but the parameter is kept so existing callers, including any using
+     * named arguments, are unaffected. adjustStockAndAvailability() still consults it to
+     * decide whether hitting zero should mark the variant unavailable.
+     */
     public static function adjustStock(int $variantId, int $delta, bool $allowNegative = false): int
     {
-        $newStock = self::adjustVariantStock($variantId, $delta, $allowNegative);
+        $newStock = self::adjustVariantStock($variantId, $delta);
 
         J2CommerceHelper::plugin()->event('AfterStockAdjust', [$variantId, $newStock]);
 
@@ -1177,7 +1301,7 @@ class InventoryHelper
      */
     public static function adjustStockAndAvailability(int $variantId, int $delta, bool $allowNegative = false): int
     {
-        $newStock = self::adjustVariantStock($variantId, $delta, $allowNegative);
+        $newStock = self::adjustVariantStock($variantId, $delta);
 
         if ($newStock <= 0 && !$allowNegative) {
             self::setVariantAvailability($variantId, 0);
@@ -1190,7 +1314,17 @@ class InventoryHelper
         return $newStock;
     }
 
-    private static function adjustVariantStock(int $variantId, int $delta, bool $allowNegative = false): int
+    /**
+     * Apply a signed delta to a variant's stock and return the resulting quantity.
+     *
+     * Nothing is clamped here. A debit used to stop at zero while the matching credit
+     * added back the full line quantity, so a debit larger than the stock on hand
+     * returned more than it ever took and manufactured the difference. Storing the true
+     * signed value keeps the two symmetrical; a negative reads as oversold, which is a
+     * fact worth keeping. Callers that must not show a negative use
+     * getAvailableQuantity(), which floors at zero for display.
+     */
+    private static function adjustVariantStock(int $variantId, int $delta): int
     {
         $db = self::getDatabase();
 
@@ -1206,28 +1340,18 @@ class InventoryHelper
 
         if ($existingId) {
             // Atomic update — avoids read-then-write race condition
-            if ($delta < 0 && !$allowNegative) {
-                // Clamp at zero: GREATEST(0, quantity + delta)
-                $db->setQuery(
-                    'UPDATE ' . $db->quoteName('#__j2commerce_productquantities') .
-                    ' SET ' . $db->quoteName('quantity') . ' = GREATEST(0, ' .
-                    $db->quoteName('quantity') . ' + ' . (int) $delta . ')' .
-                    ' WHERE ' . $db->quoteName('variant_id') . ' = ' . (int) $variantId
-                );
-            } else {
-                // Allow negative (backorders) or positive (restore)
-                $db->setQuery(
-                    'UPDATE ' . $db->quoteName('#__j2commerce_productquantities') .
-                    ' SET ' . $db->quoteName('quantity') . ' = ' .
-                    $db->quoteName('quantity') . ' + ' . (int) $delta .
-                    ' WHERE ' . $db->quoteName('variant_id') . ' = ' . (int) $variantId
-                );
-            }
+            $db->setQuery(
+                'UPDATE ' . $db->quoteName('#__j2commerce_productquantities') .
+                ' SET ' . $db->quoteName('quantity') . ' = ' .
+                $db->quoteName('quantity') . ' + ' . (int) $delta .
+                ' WHERE ' . $db->quoteName('variant_id') . ' = ' . (int) $variantId
+            );
 
             $db->execute();
         } else {
-            // Insert new record
-            $newQty = $delta < 0 && !$allowNegative ? max(0, $delta) : $delta;
+            // Insert new record. A debit against a variant with no quantity row still
+            // records what it took, so the matching credit returns that and no more.
+            $newQty = $delta;
 
             $query = $db->getQuery(true)
                 ->insert($db->quoteName('#__j2commerce_productquantities'))

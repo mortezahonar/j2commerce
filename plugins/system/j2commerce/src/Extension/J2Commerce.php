@@ -14,6 +14,7 @@ namespace J2Commerce\Plugin\System\J2Commerce\Extension;
 
 \defined('_JEXEC') or die;
 
+use J2Commerce\Component\J2commerce\Administrator\Helper\CartHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\J2CommerceHelper;
 use J2Commerce\Component\J2commerce\Administrator\SetupGuide\SetupGuideHelper;
 use J2Commerce\Component\J2commerce\Site\Context\AdminOrderCheckoutContext;
@@ -102,19 +103,19 @@ class J2Commerce extends CMSPlugin implements SubscriberInterface
     public static function getSubscribedEvents(): array
     {
         return [
-            'onAfterInitialise'                => 'onAfterInitialise',
-            'onAfterRoute'                     => 'onAfterRoute',
-            'onAfterRender'                    => 'onAfterRender',
-            'onContentPrepare'                 => 'onContentPrepare',
-            'onUserLogin'                      => 'onUserLogin',
-            'onBeforeCompileHead'              => ['onBeforeCompileHead', Priority::LOW],
-            'onJ2CommerceAfterUpdateCart'      => 'onJ2CommerceAfterUpdateCart',
-            'onJ2CommerceBeforeGetPrice'       => 'onJ2CommerceBeforeGetPrice',
-            'onJ2CommerceCalculateFees'        => 'onJ2CommerceCalculateFees',
-            'onJ2CommerceProcessCron'          => 'onJ2CommerceProcessCron',
-            'onJ2CommerceGetDashboardMessages' => 'onGetDashboardMessages',
+            'onAfterInitialise'                  => 'onAfterInitialise',
+            'onAfterRoute'                       => 'onAfterRoute',
+            'onAfterRender'                      => 'onAfterRender',
+            'onContentPrepare'                   => 'onContentPrepare',
+            'onUserLogin'                        => 'onUserLogin',
+            'onBeforeCompileHead'                => ['onBeforeCompileHead', Priority::LOW],
+            'onJ2CommerceAfterUpdateCart'        => 'onJ2CommerceAfterUpdateCart',
+            'onJ2CommerceBeforeGetPrice'         => 'onJ2CommerceBeforeGetPrice',
+            'onJ2CommerceCalculateFees'          => 'onJ2CommerceCalculateFees',
+            'onJ2CommerceProcessCron'            => 'onJ2CommerceProcessCron',
+            'onJ2CommerceGetDashboardMessages'   => 'onGetDashboardMessages',
             'onJ2CommerceResolveCheckoutContext' => 'onResolveCheckoutContext',
-            'onAjaxJ2commerce'                 => 'onAjaxJ2commerce',
+            'onAjaxJ2commerce'                   => 'onAjaxJ2commerce',
         ];
     }
 
@@ -417,16 +418,15 @@ class J2Commerce extends CMSPlugin implements SubscriberInterface
             return;
         }
 
-        $session      = Factory::getApplication()->getSession();
-        $oldSessionId = $session->get('old_sessionid', '', self::SESSION_NAMESPACE);
-        $userId       = (int) UserHelper::getUserId($user['username']);
+        $session = Factory::getApplication()->getSession();
+        $userId  = (int) UserHelper::getUserId($user['username']);
 
         if ($userId === 0) {
             return;
         }
 
         // Migrate cart to logged-in user
-        $this->migrateCartOnLogin($oldSessionId, $userId, $session->getId());
+        $this->migrateCartOnLogin($userId, $session->getId());
     }
 
     /**
@@ -746,7 +746,10 @@ class J2Commerce extends CMSPlugin implements SubscriberInterface
     /**
      * Migrates cart from guest session to logged-in user.
      *
-     * @param   string  $oldSessionId    The previous session ID
+     * Uses the persistent cart cookie (set when the guest cart was created) to locate
+     * and claim the guest cart. The cookie survives Joomla's session regeneration on
+     * login, making it the reliable bridge between guest and authenticated state.
+     *
      * @param   int     $userId          The user ID
      * @param   string  $newSessionId    The current session ID
      *
@@ -754,43 +757,118 @@ class J2Commerce extends CMSPlugin implements SubscriberInterface
      *
      * @since   6.0.0
      */
-    private function migrateCartOnLogin(string $oldSessionId, int $userId, string $newSessionId): void
+    private function migrateCartOnLogin(int $userId, string $newSessionId): void
     {
-        // Note: Full cart migration requires CartService to be implemented
-        // This is a placeholder that updates cart session references directly
-
         $db = $this->getDatabase();
 
         try {
-            if (!empty($oldSessionId)) {
-                // Update cart items from the old session to user
-                $query = $db->getQuery(true)
-                    ->update($db->quoteName('#__j2commerce_carts'))
-                    ->set($db->quoteName('user_id') . ' = :userId')
-                    ->set($db->quoteName('session_id') . ' = :newSessionId')
-                    ->where($db->quoteName('session_id') . ' = :oldSessionId')
-                    ->bind(':userId', $userId, ParameterType::INTEGER)
-                    ->bind(':newSessionId', $newSessionId)
-                    ->bind(':oldSessionId', $oldSessionId);
+            // Locate the guest cart via the persistent cookie (30-day browser cookie that
+            // survives Joomla's session regeneration on login).
+            $app          = $this->getApplication();
+            $rawCookie    = (string) $app->getInput()->cookie->getString('j2commerce_cart_id', '');
+            $guestCart    = null;
 
-                $db->setQuery($query);
+            if ($rawCookie !== '') {
+                $cookieCartId = $this->verifyCartCookieId($rawCookie, (string) $app->get('secret', ''));
+
+                if ($cookieCartId > 0) {
+                    $guestCartQuery = $db->getQuery(true)
+                        ->select('*')
+                        ->from($db->quoteName('#__j2commerce_carts'))
+                        ->where($db->quoteName('j2commerce_cart_id') . ' = :cartId')
+                        ->where($db->quoteName('user_id') . ' = 0')
+                        ->bind(':cartId', $cookieCartId, ParameterType::INTEGER)
+                        ->setLimit(1);
+
+                    $db->setQuery($guestCartQuery);
+                    $guestCart = $db->loadObject() ?: null;
+                }
+            }
+
+            // Find the user's existing cart (if any).
+            $userCartQuery = $db->getQuery(true)
+                ->select('*')
+                ->from($db->quoteName('#__j2commerce_carts'))
+                ->where($db->quoteName('user_id') . ' = :userId')
+                ->where($db->quoteName('cart_type') . ' = ' . $db->quote('cart'))
+                ->bind(':userId', $userId, ParameterType::INTEGER)
+                ->setLimit(1);
+
+            $db->setQuery($userCartQuery);
+            $userCart = $db->loadObject() ?: null;
+
+            $cartHelper = CartHelper::getInstance();
+
+            if ($guestCart !== null && $userCart !== null) {
+                // Both carts exist: merge guest items into the user's existing cart so
+                // only one cart remains.  Claiming the guest cart raw would leave two
+                // user-owned carts, and only one is cleared on order placement —
+                // causing "ghost" items to reappear from the survivor.
+                $cartHelper->updateCartitemEntry($guestCart, $userCart);
+
+                $guestCartId = (int) $guestCart->j2commerce_cart_id;
+
+                $db->setQuery(
+                    $db->getQuery(true)
+                        ->delete($db->quoteName('#__j2commerce_carts'))
+                        ->where($db->quoteName('j2commerce_cart_id') . ' = :cartId')
+                        ->bind(':cartId', $guestCartId, ParameterType::INTEGER)
+                );
                 $db->execute();
-            } else {
-                // Just update session for existing user cart
-                $query = $db->getQuery(true)
+            } elseif ($guestCart !== null) {
+                // No existing user cart: claim the guest cart.
+                $guestCartId = (int) $guestCart->j2commerce_cart_id;
+
+                $db->setQuery(
+                    $db->getQuery(true)
+                        ->update($db->quoteName('#__j2commerce_carts'))
+                        ->set($db->quoteName('user_id') . ' = :userId')
+                        ->set($db->quoteName('session_id') . ' = :newSessionId')
+                        ->where($db->quoteName('j2commerce_cart_id') . ' = :cartId')
+                        ->bind(':userId', $userId, ParameterType::INTEGER)
+                        ->bind(':newSessionId', $newSessionId)
+                        ->bind(':cartId', $guestCartId, ParameterType::INTEGER)
+                );
+                $db->execute();
+            }
+
+            // Sync the session ID on whichever cart the user now owns.
+            $db->setQuery(
+                $db->getQuery(true)
                     ->update($db->quoteName('#__j2commerce_carts'))
                     ->set($db->quoteName('session_id') . ' = :newSessionId')
                     ->where($db->quoteName('user_id') . ' = :userId')
                     ->bind(':newSessionId', $newSessionId)
-                    ->bind(':userId', $userId, ParameterType::INTEGER);
-
-                $db->setQuery($query);
-                $db->execute();
-            }
+                    ->bind(':userId', $userId, ParameterType::INTEGER)
+            );
+            $db->execute();
         } catch (\Exception $e) {
             // Silently fail if cart table doesn't exist yet or other DB error
             // This allows the plugin to work during initial migration
         }
+    }
+
+    /**
+     * Verifies an HMAC-signed cart cookie value and returns the cart ID, or 0 on failure.
+     *
+     * Cookie format: "<cartId>.<sha256-hmac>"
+     *
+     * @param   string  $raw     Raw cookie value.
+     * @param   string  $secret  Joomla site secret.
+     *
+     * @return  int  Cart ID, or 0 if the signature is invalid.
+     *
+     * @since   6.0.0
+     */
+    private function verifyCartCookieId(string $raw, string $secret): int
+    {
+        if (!preg_match('/^(\d+)\.([0-9a-f]{64})$/', $raw, $m)) {
+            return 0;
+        }
+
+        $expected = hash_hmac('sha256', $m[1], $secret);
+
+        return hash_equals($expected, $m[2]) ? (int) $m[1] : 0;
     }
 
     /**
@@ -846,6 +924,14 @@ class J2Commerce extends CMSPlugin implements SubscriberInterface
             return;
         }
 
+        // Stamp the run before doing the work, not after. This runs from onAfterInitialise,
+        // so any request — including an anonymous front-end hit — reaches it, and several
+        // arriving as the window opens would otherwise all pass shouldRunInventoryCron()
+        // and all sweep the same orders. Stamping first closes that window; the status
+        // compare-and-swap in OrderModel::updateOrderStatus() covers what still slips
+        // through. A sweep that then fails costs at most one skipped daily run.
+        $this->updateLastRunTimestamp();
+
         // Attempt to cancel unpaid orders via OrdersModel
         try {
             $app = $this->getApplication();
@@ -864,9 +950,6 @@ class J2Commerce extends CMSPlugin implements SubscriberInterface
         } catch (\Exception $e) {
             // Model not yet implemented, skip for now
         }
-
-        // Update last run timestamp
-        $this->updateLastRunTimestamp();
     }
 
     /**
@@ -1390,8 +1473,9 @@ class J2Commerce extends CMSPlugin implements SubscriberInterface
             $productSchema
         );
 
-        // Inject the JSON-LD script
-        $script = '<script type="application/ld+json">' . json_encode($jsonLd, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT) . '</script>';
+        // Inject the JSON-LD script — HEX flags ensure no literal </script> (or
+        // quote/ampersand) can survive byte-for-byte into the script block.
+        $script = '<script type="application/ld+json">' . json_encode($jsonLd, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) . '</script>';
         $document->addCustomTag($script);
 
         $debugInfo[] = 'Schema INJECTED';
@@ -2226,9 +2310,10 @@ class J2Commerce extends CMSPlugin implements SubscriberInterface
             }
         }
 
-        // Clean and truncate
-        $description = strip_tags($description);
+        // Clean and truncate — decode entities FIRST so entity-encoded markup
+        // becomes real tags that strip_tags() can actually remove.
         $description = html_entity_decode($description, ENT_QUOTES, 'UTF-8');
+        $description = strip_tags($description);
         $description = preg_replace('/\s+/', ' ', $description);
         $description = trim($description);
 

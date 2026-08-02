@@ -13,6 +13,7 @@ declare(strict_types=1);
 \defined('_JEXEC') or die;
 
 use J2Commerce\Component\J2commerce\Administrator\CliCommands\SeedOrderLedgerCommand;
+use J2Commerce\Component\J2commerce\Administrator\Helper\AclSeedHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\CoreTemplateSyncHelper;
 use Joomla\CMS\Factory;
 use Joomla\CMS\Installer\InstallerScript;
@@ -260,6 +261,9 @@ class Com_J2commerceInstallerScript extends InstallerScript
         // so purgeLinkedArticlesFromIndex() catches articles indexed in the same batch
         $this->setFinderPluginOrdering();
 
+        $this->seedCustomAclActions();
+        $this->seedStockCommitted();
+
         $this->debugLog("=== POSTFLIGHT END ===");
     }
 
@@ -286,6 +290,105 @@ class Com_J2commerceInstallerScript extends InstallerScript
             $db->execute();
         } catch (\Throwable $e) {
             $this->debugLog('setFinderPluginOrdering failed: ' . $e->getMessage());
+        }
+    }
+
+    // ── Custom ACL action seeding ────────────────────────────────────────────
+
+    /**
+     * Seed the custom actions declared in access.xml. The component boot runs the same helper,
+     * so a site that never executes this postflight still converges.
+     */
+    /**
+     * Seed stock_committed on existing orders, once.
+     *
+     * Deliberately not an UPDATE in the schema delta: Joomla only builds check queries for
+     * RENAME/ALTER/CREATE, so Database -> Fix skips an UPDATE while still advancing the
+     * stored schema version past it. A seed lost that way would leave already-deducted
+     * orders marked uncommitted and the next status change would deduct them again.
+     *
+     * The marker lives in the component params so it is independent of #__schemas, and the
+     * seed is a one-shot: re-running it later would re-commit orders whose stock has since
+     * been legitimately returned.
+     */
+    private function seedStockCommitted(): void
+    {
+        try {
+            $db = Factory::getContainer()->get(DatabaseInterface::class);
+
+            $columns = $db->getTableColumns('#__j2commerce_orders', false);
+
+            if (!isset($columns['stock_committed'])) {
+                $this->debugLog('seedStockCommitted: column not present yet, nothing to seed');
+
+                return;
+            }
+
+            $query = $db->getQuery(true)
+                ->select($db->quoteName('params'))
+                ->from($db->quoteName('#__extensions'))
+                ->where($db->quoteName('element') . ' = ' . $db->quote('com_j2commerce'))
+                ->where($db->quoteName('type') . ' = ' . $db->quote('component'));
+            $db->setQuery($query);
+
+            $params = new Registry((string) $db->loadResult());
+
+            if ((int) $params->get('stock_committed_seeded', 0) === 1) {
+                return;
+            }
+
+            // Mirror the rule in force immediately before the flag existed: everything except
+            // Failed, New and Cancelled was treated as holding deducted stock.
+            $db->setQuery(
+                $db->getQuery(true)
+                    ->update($db->quoteName('#__j2commerce_orders'))
+                    ->set($db->quoteName('stock_committed') . ' = 1')
+                    ->where($db->quoteName('order_state_id') . ' NOT IN (3, 5, 6)')
+            );
+            $db->execute();
+
+            $seeded = $db->getAffectedRows();
+
+            $params->set('stock_committed_seeded', 1);
+
+            $paramsJson = $params->toString();
+            $db->setQuery(
+                $db->getQuery(true)
+                    ->update($db->quoteName('#__extensions'))
+                    ->set($db->quoteName('params') . ' = :params')
+                    ->where($db->quoteName('element') . ' = ' . $db->quote('com_j2commerce'))
+                    ->where($db->quoteName('type') . ' = ' . $db->quote('component'))
+                    ->bind(':params', $paramsJson)
+            );
+            $db->execute();
+
+            $this->debugLog('seedStockCommitted: seeded ' . $seeded . ' order(s)');
+        } catch (\Throwable $e) {
+            // Leave the marker unset so the next update retries rather than skipping silently.
+            $this->debugLog('seedStockCommitted failed: ' . $e->getMessage());
+        }
+    }
+
+    private function seedCustomAclActions(): void
+    {
+        // On a fresh install the PSR-4 map for this namespace is built at the start of the
+        // request, before the component exists, so the helper will not autoload here.
+        $helperFile = JPATH_ADMINISTRATOR . '/components/com_j2commerce/src/Helper/AclSeedHelper.php';
+
+        if (!class_exists(AclSeedHelper::class) && file_exists($helperFile)) {
+            require_once $helperFile;
+        }
+
+        try {
+            AclSeedHelper::ensureSeeded(fn (string $message) => $this->debugLog($message));
+        } catch (\Throwable $e) {
+            // Log the failure: the flag stays unset, so canAccess() keeps its core.manage fallback.
+            $this->debugLog('seedCustomAclActions failed: ' . $e->getMessage());
+
+            Factory::getApplication()->enqueueMessage(
+                Text::_('COM_J2COMMERCE_INSTALL_ACL_SEED_FAILED'),
+                'warning'
+            );
         }
     }
 
@@ -603,25 +706,56 @@ class Com_J2commerceInstallerScript extends InstallerScript
             $this->writeFileIfMissing($dir . '/index.html', '<!DOCTYPE html><title></title>');
         }
 
+        // Deny the whole tree: every legitimate read is streamed by PHP, nothing links to a URL here.
         $htaccess = <<<'HTACCESS'
 # J2Commerce file storage
 # Disable directory browsing
 Options -Indexes
 
-# Block executable/script files
+# Deny direct web access to every file in this tree. Downloads are streamed by PHP.
+<IfModule mod_authz_core.c>
+    Require all denied
+</IfModule>
+
+<IfModule !mod_authz_core.c>
+    Order allow,deny
+    Deny from all
+</IfModule>
+
+# Belt and braces: never hand off an executable here, even if the rules above are
+# overridden by a vhost that disallows this directive scope.
 <FilesMatch "\.(php|phtml|phar|pl|py|jsp|asp|aspx|sh|cgi|exe|bat)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+
     <IfModule !mod_authz_core.c>
         Order allow,deny
         Deny from all
-    </IfModule>
-
-    <IfModule mod_authz_core.c>
-        Require all denied
     </IfModule>
 </FilesMatch>
 HTACCESS;
 
         $this->writeFileOverwrite($root . '/.htaccess', $htaccess);
+
+        $webConfig = <<<'WEBCONFIG'
+<?xml version="1.0" encoding="utf-8"?>
+<!-- J2Commerce file storage: deny direct web access. Downloads are streamed by PHP. -->
+<configuration>
+    <system.webServer>
+        <directoryBrowse enabled="false" />
+        <handlers accessPolicy="None" />
+        <security>
+            <authorization>
+                <remove users="*" roles="" verbs="" />
+                <add accessType="Deny" users="*" />
+            </authorization>
+        </security>
+    </system.webServer>
+</configuration>
+WEBCONFIG;
+
+        $this->writeFileOverwrite($root . '/web.config', $webConfig);
 
         $readme = <<<'README'
 # J2Commerce Customer Upload Storage
@@ -631,17 +765,32 @@ This directory holds customer-supplied files attached to orders (product-option 
 - `tmp/{cart_id}/` — uploads bound to in-progress carts; cleaned by the `j2commerce.cleanupOrderUploads` scheduled task once `expires_on` passes.
 - `orders/{order_id}/` — uploads attached to a placed order; cleaned by the same task per configured retention.
 
-Direct web access is denied via `.htaccess`. Downloads must go through `OrderfileController` (admin-only, CSRF + ACL gated).
+## Web access
+
+Nothing in this tree is meant to be fetched by URL. Files are streamed by PHP after an
+authorisation check — `OrderfileController` for admin order attachments, `MyprofileController`
+for a customer's own downloads.
+
+- `.htaccess` denies every request under this tree on Apache (`Require all denied`, with the
+  pre-2.4 `Order allow,deny` form for older servers), and separately blocks executable
+  extensions in case the blanket rule is overridden by the vhost.
+- `web.config` denies every request under this tree on IIS and disables handlers.
+
+Both files only take effect if the web server is configured to honour them — Apache needs
+`AllowOverride` to permit `Limit`/`AuthConfig` in this path, and IIS needs the URL
+Authorization feature installed. Verify by requesting a known filename in a browser: you
+should get 403, not the file.
 
 ## Nginx equivalent
 
-If your site is served by Nginx instead of Apache, add this to your server block:
+Nginx reads neither file. If your site is served by Nginx, add this to your server block:
 
 ```nginx
 location ~ ^/files/com_j2commerce { deny all; return 403; }
 ```
 
-Do not store anything in this tree manually — admin order views look up files by `#__j2commerce_uploads` row, not by filesystem scan.
+Do not store anything in this tree manually — admin order views look up files by
+`#__j2commerce_uploads` row, not by filesystem scan.
 README;
 
         $this->writeFileIfMissing($root . '/README.md', $readme);
