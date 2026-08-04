@@ -14,18 +14,22 @@ namespace J2Commerce\Component\J2commerce\Api\Controller;
 
 \defined('_JEXEC') or die;
 
-use J2Commerce\Component\J2commerce\Api\Controller\J2CommerceApiController;
 
 class OrderitemsController extends J2CommerceApiController
 {
+    use OrderScopedListTrait;
+
     protected $contentType = 'orderitems';
 
     protected $default_view = 'orderitems';
 
+    protected string $readAction = 'j2commerce.vieworders';
+
+    protected string $writeAction = 'j2commerce.editorders';
+
     public function displayList()
     {
-        $orderId = $this->input->get('id', 0, 'int');
-        $this->modelState->set('filter.order_id', $orderId);
+        $this->scopeToRouteOrder();
 
         return parent::displayList();
     }

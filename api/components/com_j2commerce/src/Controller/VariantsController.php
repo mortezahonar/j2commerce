@@ -14,13 +14,16 @@ namespace J2Commerce\Component\J2commerce\Api\Controller;
 
 \defined('_JEXEC') or die;
 
-use J2Commerce\Component\J2commerce\Api\Controller\J2CommerceApiController;
 
 class VariantsController extends J2CommerceApiController
 {
     protected $contentType = 'variants';
 
     protected $default_view = 'variants';
+
+    protected string $readAction = 'j2commerce.viewproducts';
+
+    protected string $writeAction = 'j2commerce.editproducts';
 
     public function displayList()
     {

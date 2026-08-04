@@ -42,13 +42,40 @@ class AclSeedHelper
     public const CUSTOM_ACL_ACTIONS = [
         'j2commerce.vieworders',
         'j2commerce.editorders',
+        'j2commerce.exportorders',
         'j2commerce.viewproducts',
+        'j2commerce.editproducts',
         'j2commerce.viewreports',
         'j2commerce.viewsetup',
+        'j2commerce.editsetup',
     ];
 
     /** Extension-params key marking the seed as done; canAccess() reads it too. */
     public const ACL_SEED_FLAG = 'acl_custom_actions_seeded';
+
+    /**
+     * Bump whenever an action is added to CUSTOM_ACL_ACTIONS.
+     *
+     * ACL_SEED_FLAG alone cannot express this: it is already 1 everywhere, so a new action
+     * would never be seeded, and canAccess() would resolve it to false for every group that
+     * is not a Super User — silently removing access the merchant never changed. The version
+     * lets the seed run again for the actions that have no rule yet, and the pass is a no-op
+     * for the ones that already do.
+     *
+     * 2 — 6.5.0 added j2commerce.editproducts and j2commerce.editsetup.
+     * 3 — 6.5.0 added j2commerce.exportorders.
+     */
+    public const SEED_VERSION = 3;
+
+    /** Extension-params key holding the version of CUSTOM_ACL_ACTIONS last seeded. */
+    public const SEED_VERSION_FLAG = 'acl_seed_version';
+
+    /** Seed version each action first shipped in. Anything not listed shipped at version 1. */
+    private const ACTION_SEED_VERSION = [
+        'j2commerce.editproducts' => 2,
+        'j2commerce.editsetup'    => 2,
+        'j2commerce.exportorders' => 3,
+    ];
 
     /**
      * Seed the custom actions unless the flag is already set.
@@ -78,9 +105,10 @@ class AclSeedHelper
             return false;
         }
 
-        $params = new Registry($extension->params);
+        $params  = new Registry($extension->params);
+        $pending = self::pendingActions($params);
 
-        if ((int) $params->get(self::ACL_SEED_FLAG, 0) === 1) {
+        if (!$pending) {
             $log('ACL SEED: already seeded — skipped');
 
             return true;
@@ -136,7 +164,7 @@ class AclSeedHelper
                 continue;
             }
 
-            foreach (self::CUSTOM_ACL_ACTIONS as $action) {
+            foreach ($pending as $action) {
                 // null = nothing set anywhere in the group's path. false = an explicit
                 // deny an administrator entered; honour it rather than overwrite it.
                 if (Access::checkGroup($groupId, $action, 'com_j2commerce') !== null) {
@@ -163,7 +191,7 @@ class AclSeedHelper
                 ->update($db->quoteName('#__assets'))
                 ->set($db->quoteName('rules') . ' = :rules')
                 ->where($db->quoteName('id') . ' = :id')
-                ->where($db->quoteName('rules') . ' = :expected')
+                ->where('CAST(' . $db->quoteName('rules') . ' AS BINARY) = :expected')
                 ->bind(':rules', $rulesJson)
                 ->bind(':expected', $expectedRules)
                 ->bind(':id', $assetId, ParameterType::INTEGER);
@@ -194,6 +222,43 @@ class AclSeedHelper
         return true;
     }
 
+    /**
+     * The actions this site has not been seeded for yet.
+     *
+     * Per action rather than a single global "is the seed current" answer, because the two
+     * are not the same thing once a version is added. A merchant who set one of the older
+     * actions back to Inherited leaves no rule behind — Joomla's RulesFilter drops an empty
+     * identity and Rules omits an action with no identities — which is indistinguishable
+     * from never-configured. Re-running the whole list on a version bump would write that
+     * allow back and hand the group access the merchant had deliberately removed.
+     */
+    public static function pendingActions(Registry $params): array
+    {
+        $seeded = (int) $params->get(self::SEED_VERSION_FLAG, 0);
+
+        // Seeded before the version marker existed: everything shipped at version 1 is done.
+        if ($seeded === 0 && (int) $params->get(self::ACL_SEED_FLAG, 0) === 1) {
+            $seeded = 1;
+        }
+
+        return array_values(array_filter(
+            self::CUSTOM_ACL_ACTIONS,
+            static fn (string $action): bool => (self::ACTION_SEED_VERSION[$action] ?? 1) > $seeded
+        ));
+    }
+
+    /** Is this one action still awaiting its seed? The core.manage fallback keys on this. */
+    public static function isPendingSeed(string $action, Registry $params): bool
+    {
+        return \in_array($action, self::pendingActions($params), true);
+    }
+
+    /** Is there anything left to seed? The component boot asks this. */
+    public static function needsSeeding(Registry $params): bool
+    {
+        return self::pendingActions($params) !== [];
+    }
+
     /** Set the seed flag on the current params. False when the row changed since it was read. */
     private static function writeSeedFlag(DatabaseInterface $db, int $extensionId): bool
     {
@@ -207,11 +272,19 @@ class AclSeedHelper
 
         $params = new Registry($current);
         $params->set(self::ACL_SEED_FLAG, 1);
+        $params->set(self::SEED_VERSION_FLAG, self::SEED_VERSION);
 
         return self::writeExtensionParams($db, $params, $extensionId, $current);
     }
 
-    /** Write params only while the stored value still matches $expected. */
+    /**
+     * Write params only while the stored value still matches $expected, byte for byte.
+     *
+     * The comparison is CAST to BINARY because the default utf8mb4_unicode_ci is
+     * case-insensitive, accent-insensitive and PAD SPACE: a plain = accepts a concurrent save
+     * that differs only in letter case, accents or trailing whitespace and overwrites it.
+     * utf8mb4_bin is PAD SPACE too, and the NO PAD utf8mb4_0900_bin does not exist on MariaDB.
+     */
     private static function writeExtensionParams(
         DatabaseInterface $db,
         Registry $params,
@@ -224,7 +297,7 @@ class AclSeedHelper
             ->update($db->quoteName('#__extensions'))
             ->set($db->quoteName('params') . ' = :params')
             ->where($db->quoteName('extension_id') . ' = :id')
-            ->where($db->quoteName('params') . ' = :expected')
+            ->where('CAST(' . $db->quoteName('params') . ' AS BINARY) = :expected')
             ->bind(':params', $paramsJson)
             ->bind(':expected', $expected)
             ->bind(':id', $extensionId, ParameterType::INTEGER);

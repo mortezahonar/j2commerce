@@ -47,6 +47,15 @@ class ProductsController extends AdminProductsController
         'filter',
     ];
 
+    /**
+     * The public tasks read; without this they would inherit the admin controller's list and
+     * WriteAccessTrait would demand j2commerce.editproducts from every shopper.
+     */
+    protected function readTasks(): array
+    {
+        return array_merge(parent::readTasks(), self::PUBLIC_SITE_TASKS);
+    }
+
     public function execute($task)
     {
         // Lower-cased to match BaseController::execute(), which lower-cases the task
@@ -304,13 +313,20 @@ class ProductsController extends AdminProductsController
                 $product->params = new Registry($product->params ?? '{}');
             }
 
-            echo '<div class="' . $colClass . '">';
-            echo ProductLayoutService::renderProductItem(
+            $itemHtml = ProductLayoutService::renderProductItem(
                 $product,
                 $params,
                 ProductLayoutService::CONTEXT_LIST,
                 $itemId
             );
+
+            // A product type with no registered layout renders nothing — skip the wrapper too.
+            if (trim($itemHtml) === '') {
+                continue;
+            }
+
+            echo '<div class="' . $colClass . '">';
+            echo $itemHtml;
             echo '</div>';
         }
 

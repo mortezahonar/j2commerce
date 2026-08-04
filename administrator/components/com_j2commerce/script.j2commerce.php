@@ -14,30 +14,47 @@ declare(strict_types=1);
 
 use J2Commerce\Component\J2commerce\Administrator\CliCommands\SeedOrderLedgerCommand;
 use J2Commerce\Component\J2commerce\Administrator\Helper\AclSeedHelper;
+use J2Commerce\Component\J2commerce\Administrator\Helper\AttachmentDenyFileHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\CoreTemplateSyncHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\InventoryHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\StockCommittedSeedHelper;
+use Joomla\CMS\Access\Access;
 use Joomla\CMS\Factory;
 use Joomla\CMS\Installer\InstallerScript;
 use Joomla\CMS\Language\Text;
 use Joomla\CMS\Log\Log;
 use Joomla\Database\DatabaseDriver;
 use Joomla\Database\DatabaseInterface;
+use Joomla\Database\ParameterType;
 use Joomla\Filesystem\File;
 use Joomla\Registry\Registry;
 
 class Com_J2commerceInstallerScript extends InstallerScript
 {
+    /** Params flag: the asset rules have been settled once, so no later update re-seeds them. */
+    private const DEFAULT_ACL_FLAG = 'default_acl_seeded';
+
     protected $minimumJoomlaVersion = '6.0';
     protected $maximumJoomlaVersion = '6.99.99';
     protected $minimumPhpVersion    = '8.1';
     private string $debugLogFile    = '';
 
+    /**
+     * Always-on install trace. Written as .php behind Joomla's own die guard, because
+     * the log directory ships no .htaccess and a plain .log is served verbatim.
+     * Never pass exception text here — use Log::add() for that.
+     */
     private function debugLog(string $message): void
     {
         if (!$this->debugLogFile) {
-            $this->debugLogFile = Factory::getApplication()->get('log_path', JPATH_ADMINISTRATOR . '/logs') . '/j2commerce_install_debug.log';
+            $logPath            = Factory::getApplication()->get('log_path', JPATH_ADMINISTRATOR . '/logs');
+            $this->debugLogFile = $logPath . '/j2commerce_install_debug.php';
+
+            if (!is_file($this->debugLogFile)) {
+                file_put_contents($this->debugLogFile, "#\n#<?php die('Forbidden.'); ?>\n");
+            }
         }
+
         file_put_contents($this->debugLogFile, date('[Y-m-d H:i:s] ') . $message . "\n", FILE_APPEND);
     }
 
@@ -127,7 +144,6 @@ class Com_J2commerceInstallerScript extends InstallerScript
         $this->debugLog("INSTALL: default ACL rules set");
 
         $this->ensureFilesFolder();
-        $this->debugLog("INSTALL: files/com_j2commerce/ tree ensured");
 
         Factory::getApplication()->enqueueMessage(Text::_('COM_J2COMMERCE_INSTALL_SUCCESS'), 'success');
 
@@ -146,7 +162,6 @@ class Com_J2commerceInstallerScript extends InstallerScript
         $this->debugLog("UPDATE: default ACL rules set (if empty)");
 
         $this->ensureFilesFolder();
-        $this->debugLog("UPDATE: files/com_j2commerce/ tree ensured");
 
         $this->cleanupStaleCheckoutTemplates();
 
@@ -219,7 +234,7 @@ class Com_J2commerceInstallerScript extends InstallerScript
                 $result['failed'] ?? 0
             ));
         } catch (\Throwable $e) {
-            $this->debugLog('ORDER LEDGER SEED: aborted with error: ' . $e->getMessage());
+            $this->debugLog('ORDER LEDGER SEED: aborted with error (see the j2commerce log)');
             Log::add('Order ledger seed failed: ' . $e->getMessage(), Log::WARNING, 'j2commerce');
             return;
         }
@@ -265,8 +280,21 @@ class Com_J2commerceInstallerScript extends InstallerScript
 
         $this->seedCustomAclActions();
         $this->seedStockCommitted();
+        $this->removeLegacyDebugLog();
 
         $this->debugLog("=== POSTFLIGHT END ===");
+    }
+
+    /** Retire the pre-6.x unguarded .log left behind on upgraded sites. */
+    private function removeLegacyDebugLog(): void
+    {
+        $legacy = Factory::getApplication()->get('log_path', JPATH_ADMINISTRATOR . '/logs')
+            . '/j2commerce_install_debug.log';
+
+        if (is_file($legacy)) {
+            @unlink($legacy);
+            $this->debugLog('CLEANUP: removed the legacy unguarded install debug log');
+        }
     }
 
     // ── Finder plugin ordering ─────────────────────────────────────────────────
@@ -291,7 +319,8 @@ class Com_J2commerceInstallerScript extends InstallerScript
             $db->setQuery($query);
             $db->execute();
         } catch (\Throwable $e) {
-            $this->debugLog('setFinderPluginOrdering failed: ' . $e->getMessage());
+            $this->debugLog('setFinderPluginOrdering failed (see the j2commerce log)');
+            Log::add('setFinderPluginOrdering failed: ' . $e->getMessage(), Log::WARNING, 'j2commerce');
         }
     }
 
@@ -342,7 +371,8 @@ class Com_J2commerceInstallerScript extends InstallerScript
             AclSeedHelper::ensureSeeded(fn (string $message) => $this->debugLog($message));
         } catch (\Throwable $e) {
             // Log the failure: the flag stays unset, so canAccess() keeps its core.manage fallback.
-            $this->debugLog('seedCustomAclActions failed: ' . $e->getMessage());
+            $this->debugLog('seedCustomAclActions failed (see the j2commerce log)');
+            Log::add('seedCustomAclActions failed: ' . $e->getMessage(), Log::WARNING, 'j2commerce');
 
             Factory::getApplication()->enqueueMessage(
                 Text::_('COM_J2COMMERCE_INSTALL_ACL_SEED_FAILED'),
@@ -425,15 +455,47 @@ class Com_J2commerceInstallerScript extends InstallerScript
     /**
      * Set sensible default ACL rules for com_j2commerce if rules are empty.
      *
-     * Matches Joomla core pattern: Administrator (7) gets full access except
-     * Super Admin, Manager (6) gets core.manage + view/edit permissions.
-     * Only sets rules if currently empty — does not overwrite admin customisation.
-     *
      * @since  6.2.0
      */
     private function setDefaultAcl(): void
     {
+        try {
+            $this->seedDefaultAcl();
+        } catch (\Throwable $e) {
+            // Seeding defaults must never abort a package update. The flag stays unset, so the
+            // next update retries, and canAccess() keeps its core.manage fallback meanwhile.
+            $this->debugLog('setDefaultAcl failed (see the j2commerce log)');
+            Log::add('setDefaultAcl failed: ' . $e->getMessage(), Log::WARNING, 'j2commerce');
+        }
+    }
+
+    /**
+     * Runs from both install() and update(), so it is guarded by a one-time params flag:
+     * '{}' is what an administrator who clears every permission leaves behind, and it is
+     * byte-identical to the row com_config writes on the first Options save. Without the flag
+     * a deliberate reset would be re-populated by every subsequent update.
+     */
+    private function seedDefaultAcl(): void
+    {
         $db = Factory::getContainer()->get(DatabaseInterface::class);
+
+        $query = $db->getQuery(true)
+            ->select([$db->quoteName('extension_id'), $db->quoteName('params')])
+            ->from($db->quoteName('#__extensions'))
+            ->where($db->quoteName('element') . ' = ' . $db->quote('com_j2commerce'))
+            ->where($db->quoteName('type') . ' = ' . $db->quote('component'));
+        $db->setQuery($query);
+        $extension = $db->loadObject();
+
+        if (!$extension) {
+            return;
+        }
+
+        $storedParams = (string) $extension->params;
+
+        if ((int) (new Registry($storedParams))->get(self::DEFAULT_ACL_FLAG, 0) === 1) {
+            return;
+        }
 
         $query = $db->getQuery(true)
             ->select([$db->quoteName('id'), $db->quoteName('rules')])
@@ -446,17 +508,20 @@ class Com_J2commerceInstallerScript extends InstallerScript
             return;
         }
 
-        // Only set defaults if rules are empty (not yet configured by admin)
-        $currentRules = trim($asset->rules ?? '');
+        $storedRules = (string) $asset->rules;
 
-        if ($currentRules !== '' && $currentRules !== '{}') {
+        // Already configured: record that the defaults are settled so a later reset stands.
+        if (trim($storedRules) !== '' && trim($storedRules) !== '{}') {
+            $this->writeDefaultAclFlag($db, (int) $extension->extension_id, $storedParams);
+
             return;
         }
 
-        // Default rules matching the issue requirements:
-        // Super User (8): inherits all (no explicit rules needed)
-        // Administrator (7): everything except core.admin/core.options
-        // Manager (6): core.manage + view orders + view products + edit orders
+        // Super User (8): inherits everything, so it needs no rule of its own.
+        // Administrator (7): full component control, including Options and every edit-tier action.
+        // Manager (6): core.manage plus the read and create tier of day-to-day work.
+        // FORCE_OBJECT so a single-group map can never serialise as a JSON array, which
+        // Access would then read back with the wrong keys.
         $rules = json_encode([
             'core.admin'              => ['7' => 1],
             'core.options'            => ['7' => 1],
@@ -466,19 +531,66 @@ class Com_J2commerceInstallerScript extends InstallerScript
             'core.edit'               => ['6' => 1],
             'core.edit.state'         => ['6' => 1],
             'core.edit.own'           => ['6' => 1],
+            'core.fulfilment'         => ['7' => 1],
             'j2commerce.vieworders'   => ['6' => 1],
             'j2commerce.editorders'   => ['7' => 1],
+            'j2commerce.exportorders' => ['7' => 1],
             'j2commerce.viewproducts' => ['6' => 1],
+            'j2commerce.editproducts' => ['7' => 1],
             'j2commerce.viewreports'  => ['7' => 1],
             'j2commerce.viewsetup'    => ['7' => 1],
-        ]);
+            'j2commerce.editsetup'    => ['7' => 1],
+        ], JSON_FORCE_OBJECT);
 
+        $assetId = (int) $asset->id;
+
+        // Compare and swap on the bytes this ran against: an administrator may have saved
+        // Options → Permissions since the read, and that save must win. CAST to BINARY because
+        // the default utf8mb4_unicode_ci is case-insensitive, accent-insensitive and PAD SPACE.
         $update = $db->getQuery(true)
             ->update($db->quoteName('#__assets'))
-            ->set($db->quoteName('rules') . ' = ' . $db->quote($rules))
-            ->where($db->quoteName('id') . ' = ' . (int) $asset->id);
-        $db->setQuery($update);
-        $db->execute();
+            ->set($db->quoteName('rules') . ' = :rules')
+            ->where($db->quoteName('id') . ' = :id')
+            ->where('CAST(' . $db->quoteName('rules') . ' AS BINARY) = :expected')
+            ->bind(':rules', $rules)
+            ->bind(':expected', $storedRules)
+            ->bind(':id', $assetId, ParameterType::INTEGER);
+
+        $db->setQuery($update)->execute();
+
+        if ($db->getAffectedRows() === 0) {
+            $this->debugLog('ACL DEFAULTS: asset rules changed while seeding — left as saved');
+
+            return;
+        }
+
+        Access::clearStatics();
+
+        $this->writeDefaultAclFlag($db, (int) $extension->extension_id, $storedParams);
+    }
+
+    /** A lost compare here is harmless: the rules are written, and the next update re-reads them. */
+    private function writeDefaultAclFlag(DatabaseInterface $db, int $extensionId, string $expected): void
+    {
+        $params = new Registry($expected);
+        $params->set(self::DEFAULT_ACL_FLAG, 1);
+
+        $paramsJson = $params->toString();
+
+        $query = $db->getQuery(true)
+            ->update($db->quoteName('#__extensions'))
+            ->set($db->quoteName('params') . ' = :params')
+            ->where($db->quoteName('extension_id') . ' = :id')
+            ->where('CAST(' . $db->quoteName('params') . ' AS BINARY) = :expected')
+            ->bind(':params', $paramsJson)
+            ->bind(':expected', $expected)
+            ->bind(':id', $extensionId, ParameterType::INTEGER);
+
+        $db->setQuery($query)->execute();
+
+        if ($db->getAffectedRows() === 0) {
+            $this->debugLog('ACL DEFAULTS: extension params changed while seeding — flag left unset');
+        }
     }
 
     // ── Localisation data install ────────────────────────────────────────────────
@@ -507,7 +619,7 @@ class Com_J2commerceInstallerScript extends InstallerScript
                 $this->executeSqlFile($installer->getPath('source') . '/administrator/components/com_j2commerce/sql/install/mysql/countries.sql');
             }
         } catch (\Exception $e) {
-            $this->debugLog("LOCALISATION: countries error: " . $e->getMessage());
+            $this->debugLog('LOCALISATION: countries error (see the j2commerce log)');
             Log::add('Error installing countries: ' . $e->getMessage(), Log::WARNING, 'j2commerce');
         }
 
@@ -527,7 +639,7 @@ class Com_J2commerceInstallerScript extends InstallerScript
                 $this->executeSqlFile($installer->getPath('source') . '/administrator/components/com_j2commerce/sql/install/mysql/zones.sql');
             }
         } catch (\Exception $e) {
-            $this->debugLog("LOCALISATION: zones error: " . $e->getMessage());
+            $this->debugLog('LOCALISATION: zones error (see the j2commerce log)');
             Log::add('Error installing zones: ' . $e->getMessage(), Log::WARNING, 'j2commerce');
         }
 
@@ -536,7 +648,7 @@ class Com_J2commerceInstallerScript extends InstallerScript
             $this->executeSqlFile($installer->getPath('source') . '/administrator/components/com_j2commerce/sql/install/mysql/lengths.sql');
             $this->executeSqlFile($installer->getPath('source') . '/administrator/components/com_j2commerce/sql/install/mysql/weights.sql');
         } catch (\Exception $e) {
-            $this->debugLog("LOCALISATION: metrics error: " . $e->getMessage());
+            $this->debugLog('LOCALISATION: metrics error (see the j2commerce log)');
             Log::add('Error installing metrics: ' . $e->getMessage(), Log::WARNING, 'j2commerce');
         }
 
@@ -559,12 +671,12 @@ class Com_J2commerceInstallerScript extends InstallerScript
                 try {
                     (new CoreTemplateSyncHelper())->syncEmailTemplates();
                 } catch (\Throwable $e) {
-                    $this->debugLog("LOCALISATION: email templates sync error: " . $e->getMessage());
+                    $this->debugLog('LOCALISATION: email templates sync error (see the j2commerce log)');
                     Log::add('Error syncing core email templates: ' . $e->getMessage(), Log::WARNING, 'j2commerce');
                 }
             }
         } catch (\Exception $e) {
-            $this->debugLog("LOCALISATION: email templates error: " . $e->getMessage());
+            $this->debugLog('LOCALISATION: email templates error (see the j2commerce log)');
             Log::add('Error installing email templates: ' . $e->getMessage(), Log::WARNING, 'j2commerce');
         }
 
@@ -587,12 +699,12 @@ class Com_J2commerceInstallerScript extends InstallerScript
                 try {
                     (new CoreTemplateSyncHelper())->syncInvoiceTemplates();
                 } catch (\Throwable $e) {
-                    $this->debugLog("LOCALISATION: invoice templates sync error: " . $e->getMessage());
+                    $this->debugLog('LOCALISATION: invoice templates sync error (see the j2commerce log)');
                     Log::add('Error syncing core invoice templates: ' . $e->getMessage(), Log::WARNING, 'j2commerce');
                 }
             }
         } catch (\Exception $e) {
-            $this->debugLog("LOCALISATION: invoice templates error: " . $e->getMessage());
+            $this->debugLog('LOCALISATION: invoice templates error (see the j2commerce log)');
             Log::add('Error installing invoice templates: ' . $e->getMessage(), Log::WARNING, 'j2commerce');
         }
 
@@ -604,7 +716,7 @@ class Com_J2commerceInstallerScript extends InstallerScript
                 $this->executeSqlFile($installer->getPath('source') . '/administrator/components/com_j2commerce/sql/install/mysql/guidedtours.sql');
             }
         } catch (\Exception $e) {
-            $this->debugLog("LOCALISATION: guided tours error: " . $e->getMessage());
+            $this->debugLog('LOCALISATION: guided tours error (see the j2commerce log)');
             Log::add('Error installing guided tours: ' . $e->getMessage(), Log::WARNING, 'j2commerce');
         }
     }
@@ -631,7 +743,7 @@ class Com_J2commerceInstallerScript extends InstallerScript
                     $db->execute();
                     $executed++;
                 } catch (\Exception $e) {
-                    $this->debugLog("SQL ERROR in {$sqlPath}: " . $e->getMessage() . " | Query: " . substr($query, 0, 100));
+                    $this->debugLog("SQL ERROR in {$sqlPath} (see the j2commerce log)");
                     Log::add('SQL Error: ' . $e->getMessage(), Log::WARNING, 'j2commerce');
                 }
             } else {
@@ -651,8 +763,44 @@ class Com_J2commerceInstallerScript extends InstallerScript
      */
     private function ensureFilesFolder(): void
     {
-        $configuredPath = $this->readAttachmentFolderPath();
-        $root           = JPATH_ROOT . '/' . trim($configuredPath, '/');
+        // Same manual include as the seed helpers: on a fresh install the PSR-4 map for this
+        // namespace is built at the start of the request, before the component exists.
+        $helperFile = JPATH_ADMINISTRATOR . '/components/com_j2commerce/src/Helper/AttachmentDenyFileHelper.php';
+
+        if (!class_exists(AttachmentDenyFileHelper::class) && file_exists($helperFile)) {
+            require_once $helperFile;
+        }
+
+        // Normalised the same way ConfigHelper::getAttachmentPath() does, including its
+        // fallback for a value that normalises away entirely (a lone '/'), so the installer
+        // and the runtime never disagree about which directory the config names.
+        $relative = trim(str_replace('\\', '/', $this->readAttachmentFolderPath()), '/');
+        $relative = $relative !== '' ? $relative : AttachmentDenyFileHelper::DEFAULT_PATH;
+        $resolved = $this->resolveAttachmentRoot($relative);
+
+        // Nothing is written for a path that will not confine. Returning here leaves the tree
+        // unmade rather than dropping a deny-all ruleset somewhere it was never meant to go.
+        if ($resolved === null) {
+            $message = 'The configured attachment folder path could not be created or does not resolve '
+                . 'inside the site root. The upload storage tree was not created and no deny files were '
+                . 'written. Correct the attachment folder path in the J2Commerce options.';
+
+            // Enqueued as well as logged: category j2commerce matches no logger on a default
+            // site, and an unprotected upload tree must not be announced only where nobody reads.
+            $this->debugLog('ENSURE FILES FOLDER: configured path could not be created or does not resolve inside the site root — skipped');
+            Log::add($message, Log::WARNING, 'j2commerce');
+            Factory::getApplication()->enqueueMessage($message, 'warning');
+
+            return;
+        }
+
+        [$root, $createdNow] = $resolved;
+
+        $owned = AttachmentDenyFileHelper::ownsTree(
+            $root,
+            $createdNow,
+            $relative === AttachmentDenyFileHelper::DEFAULT_PATH
+        );
 
         foreach (['', '/tmp', '/orders'] as $sub) {
             $dir = $root . $sub;
@@ -666,55 +814,22 @@ class Com_J2commerceInstallerScript extends InstallerScript
         }
 
         // Deny the whole tree: every legitimate read is streamed by PHP, nothing links to a URL here.
-        $htaccess = <<<'HTACCESS'
-# J2Commerce file storage
-# Disable directory browsing
-Options -Indexes
+        AttachmentDenyFileHelper::writeDenyPair($root, $owned, fn (string $message) => $this->debugLog($message));
 
-# Deny direct web access to every file in this tree. Downloads are streamed by PHP.
-<IfModule mod_authz_core.c>
-    Require all denied
-</IfModule>
+        if (!$owned) {
+            // The tree stays usable for uploads but carries no deny pair, and the README is
+            // withheld so a foreign directory is never marked as J2Commerce's for later runs.
+            Factory::getApplication()->enqueueMessage(
+                'The configured attachment folder is a pre-existing directory that J2Commerce does not own, '
+                    . 'so no web-access deny files were written into it. Protect it in your web server '
+                    . 'configuration, or point the attachment folder path at a dedicated directory.',
+                'warning'
+            );
 
-<IfModule !mod_authz_core.c>
-    Order allow,deny
-    Deny from all
-</IfModule>
+            $this->debugLog("ENSURE FILES FOLDER: tree at {$root} ready (deny files withheld — directory not owned)");
 
-# Belt and braces: never hand off an executable here, even if the rules above are
-# overridden by a vhost that disallows this directive scope.
-<FilesMatch "\.(php|phtml|phar|pl|py|jsp|asp|aspx|sh|cgi|exe|bat)$">
-    <IfModule mod_authz_core.c>
-        Require all denied
-    </IfModule>
-
-    <IfModule !mod_authz_core.c>
-        Order allow,deny
-        Deny from all
-    </IfModule>
-</FilesMatch>
-HTACCESS;
-
-        $this->writeFileOverwrite($root . '/.htaccess', $htaccess);
-
-        $webConfig = <<<'WEBCONFIG'
-<?xml version="1.0" encoding="utf-8"?>
-<!-- J2Commerce file storage: deny direct web access. Downloads are streamed by PHP. -->
-<configuration>
-    <system.webServer>
-        <directoryBrowse enabled="false" />
-        <handlers accessPolicy="None" />
-        <security>
-            <authorization>
-                <remove users="*" roles="" verbs="" />
-                <add accessType="Deny" users="*" />
-            </authorization>
-        </security>
-    </system.webServer>
-</configuration>
-WEBCONFIG;
-
-        $this->writeFileOverwrite($root . '/web.config', $webConfig);
+            return;
+        }
 
         $readme = <<<'README'
 # J2Commerce Customer Upload Storage
@@ -757,10 +872,58 @@ README;
         $this->debugLog("ENSURE FILES FOLDER: tree at {$root} ready");
     }
 
+    /**
+     * Absolute, confined on-disk root for the upload tree plus whether this run created it,
+     * or null when the configured value will not resolve inside the site.
+     *
+     * trim($value, '/') strips slash characters from the ends only — it never removes a '..'
+     * segment — so the path has to be confined rather than merely trimmed. The prefix test
+     * appends a separator so a sibling directory whose name starts with the root's is not
+     * accepted, and the root itself is rejected: denying it would 403 the whole site.
+     *
+     * @return array{0: string, 1: bool}|null
+     */
+    private function resolveAttachmentRoot(string $relative): ?array
+    {
+        if (
+            $relative === ''
+            || $relative === '.'
+            || \in_array('..', explode('/', $relative), true)
+            || preg_match('#^[a-zA-Z]:#', $relative)
+        ) {
+            return null;
+        }
+
+        $absolute = JPATH_ROOT . '/' . $relative;
+        $created  = !is_dir($absolute) && @mkdir($absolute, 0755, true);
+
+        if (!$created && !is_dir($absolute)) {
+            $this->debugLog("ENSURE FILES FOLDER: could not create {$absolute}");
+
+            return null;
+        }
+
+        $real     = realpath($absolute);
+        $rootReal = realpath(JPATH_ROOT);
+
+        if ($real === false || $rootReal === false) {
+            return null;
+        }
+
+        $real     = rtrim(str_replace('\\', '/', $real), '/');
+        $rootReal = rtrim(str_replace('\\', '/', $rootReal), '/');
+
+        if ($real === $rootReal || !str_starts_with($real . '/', $rootReal . '/')) {
+            return null;
+        }
+
+        return [$real, $created];
+    }
+
     /** Read attachmentfolderpath from com_j2commerce params with safe fallback. */
     private function readAttachmentFolderPath(): string
     {
-        $default = 'files/com_j2commerce';
+        $default = AttachmentDenyFileHelper::DEFAULT_PATH;
         $db      = Factory::getContainer()->get(DatabaseInterface::class);
 
         $query = $db->getQuery(true)
@@ -783,16 +946,17 @@ README;
             return;
         }
 
-        if (@file_put_contents($path, $contents) === false) {
-            $this->debugLog("ENSURE FILES FOLDER: failed to write {$path}");
-        }
+        $this->writeFileOverwrite($path, $contents);
     }
 
     /** Write file, overwriting any existing copy. Logs and continues on failure. */
     private function writeFileOverwrite(string $path, string $contents): void
     {
         if (@file_put_contents($path, $contents) === false) {
+            // Surfaced to the configured logger as well as the trace: a failed deny-file write
+            // leaves the tree readable over HTTP, which the trace alone would never announce.
             $this->debugLog("ENSURE FILES FOLDER: failed to write {$path}");
+            Log::add('Failed to write ' . $path, Log::WARNING, 'j2commerce');
         }
     }
 }

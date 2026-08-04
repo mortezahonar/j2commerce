@@ -15,13 +15,16 @@ namespace J2Commerce\Component\J2commerce\Api\Controller;
 \defined('_JEXEC') or die;
 
 use Joomla\CMS\Filter\InputFilter;
-use J2Commerce\Component\J2commerce\Api\Controller\J2CommerceApiController;
 
 class ProductsController extends J2CommerceApiController
 {
     protected $contentType = 'products';
 
     protected $default_view = 'products';
+
+    protected string $readAction = 'j2commerce.viewproducts';
+
+    protected string $writeAction = 'j2commerce.editproducts';
 
     public function getModel($name = '', $prefix = '', $config = [])
     {
@@ -36,7 +39,7 @@ class ProductsController extends J2CommerceApiController
     public function displayList()
     {
         $apiFilterInfo = $this->input->get('filter', [], 'array');
-        $filter = InputFilter::getInstance();
+        $filter        = InputFilter::getInstance();
 
         if (\array_key_exists('search', $apiFilterInfo)) {
             $this->modelState->set('filter.search', $filter->clean($apiFilterInfo['search'], 'STRING'));

@@ -113,7 +113,10 @@ class StockCommittedSeedHelper
 
             return true;
         } catch (\Throwable $e) {
-            $log('STOCK SEED failed: ' . $e->getMessage());
+            // The installer passes debugLog() as the callback and that trace is web-served, so
+            // it never carries exception text — an SQLSTATE string names the prefixed table.
+            $log('STOCK SEED failed (see the j2commerce log)');
+            Log::add('Stock committed seed failed: ' . $e->getMessage(), Log::WARNING, 'j2commerce');
 
             return false;
         }
@@ -183,11 +186,14 @@ class StockCommittedSeedHelper
             $params->set(self::SEED_FLAG, 1);
             $paramsJson = $params->toString();
 
+            // CAST to BINARY so the compare-and-swap matches the bytes actually read: the
+            // default utf8mb4_unicode_ci is case-insensitive, accent-insensitive and PAD SPACE,
+            // so a bare compare could match a concurrently saved row and overwrite it.
             $write = $db->getQuery(true)
                 ->update($db->quoteName('#__extensions'))
                 ->set($db->quoteName('params') . ' = :params')
                 ->where($db->quoteName('extension_id') . ' = :id')
-                ->where($db->quoteName('params') . ' = :expected')
+                ->where('CAST(' . $db->quoteName('params') . ' AS BINARY) = :expected')
                 ->bind(':params', $paramsJson)
                 ->bind(':expected', $expected)
                 ->bind(':id', $extensionId, ParameterType::INTEGER);

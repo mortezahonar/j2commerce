@@ -14,11 +14,14 @@ namespace J2Commerce\Component\J2commerce\Api\Controller;
 
 \defined('_JEXEC') or die;
 
-use J2Commerce\Component\J2commerce\Api\Controller\J2CommerceApiController;
 
 class OrderstatusesController extends J2CommerceApiController
 {
     protected $contentType = 'orderstatuses';
 
     protected $default_view = 'orderstatuses';
+
+    protected string $readAction = 'j2commerce.viewsetup';
+
+    protected string $writeAction = 'j2commerce.editsetup';
 }

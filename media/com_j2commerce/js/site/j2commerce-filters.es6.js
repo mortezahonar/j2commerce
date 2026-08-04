@@ -228,12 +228,17 @@ class J2CommerceFilters {
         const catid = document.getElementById('filter_catid')?.value || '';
         if (catid) data.append('filter_catid', catid);
 
-        const priceFrom = parseFloat(document.getElementById('min_price_input')?.value) || 0;
-        const priceTo = parseFloat(document.getElementById('max_price_input')?.value) || 0;
         const rangeMin = document.getElementById('j2commerce-range-min');
         const rangeMax = document.getElementById('j2commerce-range-max');
-        const isCustomPrice = rangeMin && rangeMax && (priceFrom > parseFloat(rangeMin.min) || priceTo < parseFloat(rangeMax.max));
+        // Compare slider POSITION against its attributes — not the hidden price input
+        // values — to avoid a float precision mismatch (Math.ceil(maxPrice) vs rawPrice).
+        const isCustomPrice = rangeMin && rangeMax && (
+            parseFloat(rangeMin.value) > parseFloat(rangeMin.min) ||
+            parseFloat(rangeMax.value) < parseFloat(rangeMax.max)
+        );
         if (isCustomPrice) {
+            const priceFrom = parseFloat(document.getElementById('min_price_input')?.value) || 0;
+            const priceTo = parseFloat(document.getElementById('max_price_input')?.value) || 0;
             if (priceFrom > 0) data.append('pricefrom', priceFrom.toString());
             if (priceTo > 0) data.append('priceto', priceTo.toString());
         }
@@ -428,6 +433,11 @@ class J2CommerceFilters {
             params.set('sort', sefSort);
         }
 
+        const pricefrom = formData.get('pricefrom');
+        const priceto = formData.get('priceto');
+        if (pricefrom) params.set('pricefrom', pricefrom);
+        if (priceto) params.set('priceto', priceto);
+
         if (limitstart > 0) {
             params.set('start', limitstart.toString());
         }
@@ -458,19 +468,17 @@ class J2CommerceFilters {
         if (rangeMin) rangeMin.value = rangeMin.min;
         if (rangeMax) rangeMax.value = rangeMax.max;
 
+        // Trigger the template's updateDisplays to refresh min_price_display / max_price_display.
+        // Use non-bubbling event to avoid re-triggering the sliderContainer delegation listener.
+        if (rangeMin) rangeMin.dispatchEvent(new Event('input', { bubbles: false }));
+
         // CRITICAL: Set hidden price inputs to 0 to DISABLE price filtering
-        // collectFilterData() only sends price params if value > 0
-        // Setting to slider min/max would still filter; setting to 0 disables filtering
+        // collectFilterData() only sends price params if value > 0.
+        // updateDisplays() above set them to slider min/max; override back to 0.
         const minPriceInput = document.getElementById('min_price_input');
         const maxPriceInput = document.getElementById('max_price_input');
         if (minPriceInput) minPriceInput.value = '0';
         if (maxPriceInput) maxPriceInput.value = '0';
-
-        // Update display elements to show the full range
-        const minPriceSpan = document.getElementById('min_price');
-        const maxPriceSpan = document.getElementById('max_price');
-        if (minPriceSpan && rangeMin) minPriceSpan.textContent = rangeMin.min;
-        if (maxPriceSpan && rangeMax) maxPriceSpan.textContent = rangeMax.max;
 
         this.applyFilters();
     }
@@ -660,15 +668,19 @@ class J2CommerceFilters {
         });
 
         // Price range tile (only when customized from defaults)
-        const priceFrom = parseFloat(document.getElementById('min_price_input')?.value) || 0;
-        const priceTo = parseFloat(document.getElementById('max_price_input')?.value) || 0;
+        // Price range tile — compare slider POSITION against its min/max attributes,
+        // not the hidden price inputs against the slider attributes.
+        // The slider uses Math.floor/ceil so rangeMax.max may differ from the raw
+        // catalog price stored in max_price_input, causing a false "custom price"
+        // detection on every fresh page load.
         const rangeMin = document.getElementById('j2commerce-range-min');
         const rangeMax = document.getElementById('j2commerce-range-max');
-        if (rangeMin && rangeMax && priceFrom > 0 && priceTo > 0) {
-            const isCustomPrice = (priceFrom > parseFloat(rangeMin.min) || priceTo < parseFloat(rangeMax.max));
+        if (rangeMin && rangeMax) {
+            const isCustomPrice = parseFloat(rangeMin.value) > parseFloat(rangeMin.min) ||
+                                  parseFloat(rangeMax.value) < parseFloat(rangeMax.max);
             if (isCustomPrice) {
-                const minDisplay = document.getElementById('min_price_display')?.textContent?.trim() || priceFrom;
-                const maxDisplay = document.getElementById('max_price_display')?.textContent?.trim() || priceTo;
+                const minDisplay = document.getElementById('min_price_display')?.textContent?.trim() || rangeMin.value;
+                const maxDisplay = document.getElementById('max_price_display')?.textContent?.trim() || rangeMax.value;
                 tiles.push(this.createTileHtml('price', 'price', `${minDisplay} – ${maxDisplay}`));
             }
         }
@@ -756,6 +768,7 @@ class J2CommerceFilters {
                 const rangeMax = document.getElementById('j2commerce-range-max');
                 if (rangeMin) rangeMin.value = rangeMin.min;
                 if (rangeMax) rangeMax.value = rangeMax.max;
+                if (rangeMin) rangeMin.dispatchEvent(new Event('input', { bubbles: false }));
                 const minInput = document.getElementById('min_price_input');
                 const maxInput = document.getElementById('max_price_input');
                 if (minInput) minInput.value = '0';
