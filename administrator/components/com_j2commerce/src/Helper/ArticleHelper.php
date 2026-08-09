@@ -14,12 +14,13 @@ namespace J2Commerce\Component\J2commerce\Administrator\Helper;
 
 \defined('_JEXEC') or die;
 
+use Joomla\CMS\Categories\CategoryNode;
+use Joomla\CMS\Categories\CategoryServiceInterface;
 use Joomla\CMS\Component\ComponentHelper;
 use Joomla\CMS\Factory;
 use Joomla\CMS\Filter\OutputFilter;
 use Joomla\CMS\HTML\HTMLHelper;
 use Joomla\CMS\Language\Associations;
-use Joomla\CMS\Language\LanguageAssociations;
 use Joomla\CMS\Language\LanguageHelper;
 use Joomla\CMS\Language\Text;
 use Joomla\CMS\Router\Route;
@@ -223,7 +224,7 @@ class ArticleHelper
         $urlSelect    = $linkArticles . '&amp;function=jSelectJ2Article_' . $id;
         if ($value) {
             $db    = Factory::getContainer()->get('DatabaseDriver');
-            $query = $db->getQuery(true)
+            $query = $db->createQuery()
                 ->select($db->quoteName('title'))
                 ->from($db->quoteName('#__content'))
                 ->where($db->quoteName('id') . ' = :value')
@@ -311,9 +312,12 @@ class ArticleHelper
         }
 
         $db    = self::getDatabase();
-        $query = $db->getQuery(true);
+        $query = $db->createQuery();
 
-        $query->select('*')
+        // Column list covers every property read by this helper's own consumers
+        // (display(), getArticleLink()) and by the shipped plugins that call
+        // getArticle(). `fulltext` is a MySQL reserved word — quoteName() is required.
+        $query->select($db->quoteName(['id', 'title', 'introtext', 'fulltext', 'catid', 'language', 'state', 'access']))
             ->from($db->quoteName('#__content'))
             ->where($db->quoteName('id') . ' = :id')
             ->bind(':id', $id, ParameterType::INTEGER);
@@ -361,9 +365,9 @@ class ArticleHelper
         }
 
         $db    = self::getDatabase();
-        $query = $db->getQuery(true);
+        $query = $db->createQuery();
 
-        $query->select('*')
+        $query->select($db->quoteName(['id', 'title', 'alias', 'introtext', 'fulltext', 'catid', 'language', 'state', 'access']))
             ->from($db->quoteName('#__content'));
 
         if ($contentId > 0) {
@@ -424,13 +428,18 @@ class ArticleHelper
             return '';
         }
 
-        return Route::_(
-            ContentRouteHelper::getArticleRoute(
-                (int) $article->id,
-                (int) $article->catid,
-                $article->language ?? ''
-            )
-        );
+        // Route::_() returns null on router error today and will throw from Joomla 7.
+        try {
+            return (string) (Route::_(
+                ContentRouteHelper::getArticleRoute(
+                    (int) $article->id,
+                    (int) $article->catid,
+                    $article->language ?? ''
+                )
+            ) ?? '');
+        } catch (\RuntimeException) {
+            return '';
+        }
     }
 
     // =========================================================================
@@ -488,14 +497,14 @@ class ArticleHelper
             return [];
         }
 
-        $user   = Factory::getApplication()->getIdentity();
-        $groups = implode(',', $user->getAuthorisedViewLevels());
+        $user       = Factory::getApplication()->getIdentity();
+        $viewLevels = $user->getAuthorisedViewLevels();
 
         if (empty($currentTag)) {
             $currentTag = Factory::getApplication()->getLanguage()->getTag();
         }
 
-        $associations = LanguageAssociations::getAssociations(
+        $associations = Associations::getAssociations(
             'com_content',
             '#__content',
             'com_content.item',
@@ -520,11 +529,11 @@ class ArticleHelper
 
             // Verify the associated article is accessible
             $db    = self::getDatabase();
-            $query = $db->getQuery(true)
+            $query = $db->createQuery()
                 ->select($db->quoteName('state'))
                 ->from($db->quoteName('#__content'))
                 ->where($db->quoteName('id') . ' = :assocId')
-                ->where($db->quoteName('access') . ' IN (' . $groups . ')')
+                ->whereIn($db->quoteName('access'), $viewLevels, ParameterType::INTEGER)
                 ->bind(':assocId', $assocId, ParameterType::INTEGER);
 
             $db->setQuery($query);
@@ -574,7 +583,7 @@ class ArticleHelper
         }
 
         $db    = self::getDatabase();
-        $query = $db->getQuery(true);
+        $query = $db->createQuery();
 
         $referenceTable = 'content';
         $referenceField = 'alias';
@@ -619,7 +628,7 @@ class ArticleHelper
         $defaultLangId = self::getLanguageIdByTag($defaultLang);
 
         $db    = self::getDatabase();
-        $query = $db->getQuery(true);
+        $query = $db->createQuery();
 
         // If requesting default language, get original_text; otherwise get translated value
         if ($defaultLangId === $langId) {
@@ -676,7 +685,7 @@ class ArticleHelper
         }
 
         $db    = self::getDatabase();
-        $query = $db->getQuery(true);
+        $query = $db->createQuery();
 
         $query->select($db->quoteName('lang_id'))
             ->from($db->quoteName('#__falang_languages'))
@@ -693,15 +702,19 @@ class ArticleHelper
     // =========================================================================
 
     /**
-     * Get a category by ID.
+     * Get a content category by ID.
+     *
+     * Delegates to the core com_content category service rather than querying
+     * `#__categories` directly. `access => false` and `published => 0` keep the
+     * previous behaviour of returning categories regardless of state or view level.
      *
      * @param   int  $id  The category ID.
      *
-     * @return  object|null  Category object or null if not found.
+     * @return  CategoryNode|null  Category node or null if not found.
      *
      * @since   6.0.0
      */
-    public static function getCategoryById(int $id): ?object
+    public static function getCategoryById(int $id): ?CategoryNode
     {
         if ($id < 1) {
             return null;
@@ -711,16 +724,13 @@ class ArticleHelper
             return self::$categoryCache[$id];
         }
 
-        $db    = self::getDatabase();
-        $query = $db->getQuery(true);
+        $component = Factory::getApplication()->bootComponent('com_content');
 
-        $query->select('*')
-            ->from($db->quoteName('#__categories'))
-            ->where($db->quoteName('id') . ' = :id')
-            ->bind(':id', $id, ParameterType::INTEGER);
+        if (!$component instanceof CategoryServiceInterface) {
+            return null;
+        }
 
-        $db->setQuery($query);
-        $category = $db->loadObject();
+        $category = $component->getCategory(['access' => false, 'published' => 0])->get($id);
 
         self::$categoryCache[$id] = $category ?: null;
 
@@ -737,7 +747,7 @@ class ArticleHelper
     public static function getContentCategories(): array
     {
         $db    = self::getDatabase();
-        $query = $db->getQuery(true);
+        $query = $db->createQuery();
 
         $extension = 'com_content';
         $published = 1;

@@ -17,18 +17,16 @@ use J2Commerce\Component\J2commerce\Administrator\Helper\ConfigHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\J2CommerceHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\ProductHelper;
 use J2Commerce\Component\J2commerce\Administrator\Service\ProductService;
+use J2Commerce\Component\J2commerce\Site\Helper\ProductVisibilityHelper;
 use J2Commerce\Component\J2commerce\Site\Service\ProductLayoutService;
 use Joomla\CMS\Cache\CacheControllerFactoryInterface;
 use Joomla\CMS\Component\ComponentHelper;
-use Joomla\CMS\Event\Content\AfterDeleteEvent;
 use Joomla\CMS\Event\Content\AfterDisplayEvent;
-use Joomla\CMS\Event\Content\AfterSaveEvent;
 use Joomla\CMS\Event\Content\BeforeDisplayEvent;
-use Joomla\CMS\Event\Content\BeforeSaveEvent;
 use Joomla\CMS\Event\Content\ContentPrepareEvent;
-use Joomla\CMS\Event\Model\AfterDeleteEvent as ModelAfterDeleteEvent;
-use Joomla\CMS\Event\Model\AfterSaveEvent as ModelAfterSaveEvent;
-use Joomla\CMS\Event\Model\BeforeSaveEvent as ModelBeforeSaveEvent;
+use Joomla\CMS\Event\Model\AfterDeleteEvent;
+use Joomla\CMS\Event\Model\AfterSaveEvent;
+use Joomla\CMS\Event\Model\BeforeSaveEvent;
 use Joomla\CMS\Event\Model\PrepareFormEvent;
 use Joomla\CMS\Factory;
 use Joomla\CMS\Form\Form;
@@ -373,7 +371,7 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
      *
      * @since  6.1.0
      */
-    private function saveCategoryJ2CommerceParams(BeforeSaveEvent|ModelBeforeSaveEvent $event): void
+    private function saveCategoryJ2CommerceParams(BeforeSaveEvent $event): void
     {
         $item = $event->getItem();
 
@@ -417,7 +415,7 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
      *
      * @since 6.0.0
      */
-    public function onContentBeforeSave(BeforeSaveEvent|ModelBeforeSaveEvent $event): void
+    public function onContentBeforeSave(BeforeSaveEvent $event): void
     {
         $context = $event->getContext();
 
@@ -464,7 +462,7 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
      *
      * @since 6.0.0
      */
-    public function onContentAfterSave(AfterSaveEvent|ModelAfterSaveEvent $event): void
+    public function onContentAfterSave(AfterSaveEvent $event): void
     {
         $context = $event->getContext();
 
@@ -713,7 +711,7 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
      *
      * @since 6.0.0
      */
-    public function onContentAfterDelete(AfterDeleteEvent|ModelAfterDeleteEvent $event): void
+    public function onContentAfterDelete(AfterDeleteEvent $event): void
     {
         $context = $event->getContext();
 
@@ -999,7 +997,7 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
         // products is populated from exactly that text, rendering it here would cause
         // it to appear as a duplicate (double introtext).
         $displayData['showDescription'] = false;
-        $displayData['showOptions'] = $showOptions;
+        $displayData['showOptions']     = $showOptions;
 
         return ProductLayoutService::renderLayout('list.category.item', $displayData);
     }
@@ -1150,7 +1148,15 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
             }
 
             $productId = (int) $values[0];
-            $product   = $this->getProductById($productId);
+
+            // Same gate the |detail branch resolves through, so both option
+            // branches answer identically on the same request.
+            if (!ProductVisibilityHelper::isViewable($productId)) {
+                $article->text = $this->replaceAtPosition($article->text, $match['raw'], '');
+                continue;
+            }
+
+            $product = $this->getProductById($productId);
 
             if (!$product) {
                 $article->text = $this->replaceAtPosition($article->text, $match['raw'], '');
@@ -1410,6 +1416,7 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
             'showCart'        => $this->optionsContainAny($allOptions, ['cart', 'cartonly', 'full', 'card', 'detail']),
             'showQtyField'    => !\in_array('noqty', $allOptions, true),
             'showSku'         => $this->optionsContainAny($allOptions, ['sku', 'full', 'card', 'detail']),
+            'showUpc'         => $this->optionsContainAny($allOptions, ['upc', 'full', 'card', 'detail']),
             'showStock'       => $this->optionsContainAny($allOptions, ['stock', 'full', 'card', 'detail']),
             'showDescription' => $this->optionsContainAny($allOptions, ['description', 'desc', 'full', 'card', 'detail']),
             'showQuickview'   => \in_array('quickview', $allOptions, true),
@@ -1437,6 +1444,7 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
         $params->set('list_show_title', 1);
         $params->set('list_show_description', 0);
         $params->set('list_show_product_sku', 0);
+        $params->set('list_show_product_upc', 0);
         $params->set('list_show_product_stock', 0);
         $params->set('list_enable_quickview', 0);
         $params->set('list_link_title', 1);

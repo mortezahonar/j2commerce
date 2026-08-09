@@ -59,6 +59,18 @@ $selectZoneJs = $jsString(Text::sprintf('COM_J2COMMERCE_SELECT_PLACEHOLDER', Tex
 $loadingJs    = $jsString(Text::_('COM_J2COMMERCE_LOADING'));
 $continueJs   = $jsString(Text::_('COM_J2COMMERCE_CHECKOUT_CONTINUE'));
 
+// Error alerts. The session and unexpected-response sentences carry a %s where the reload
+// link goes: fetchStep splits on it to insert a real anchor, so a translator receives one
+// whole sentence rather than fragments that would reorder badly. The other two contexts
+// have nowhere to put a link, so the link words are substituted here instead.
+$reloadLinkText        = Text::_('COM_J2COMMERCE_ERROR_RELOAD_THE_PAGE');
+$reloadLinkTextJs      = $jsString($reloadLinkText);
+$sessionExpiredJs      = $jsString(Text::_('COM_J2COMMERCE_ERROR_SESSION_EXPIRED'));
+$sessionExpiredFlatJs  = $jsString(Text::sprintf('COM_J2COMMERCE_ERROR_SESSION_EXPIRED', $reloadLinkText));
+$unexpectedFlatJs      = $jsString(Text::sprintf('COM_J2COMMERCE_ERROR_UNEXPECTED_RESPONSE', $reloadLinkText));
+$serverErrorJs         = $jsString(Text::_('COM_J2COMMERCE_ERROR_SERVER'));
+$networkErrorJs        = $jsString(Text::_('COM_J2COMMERCE_ERROR_NETWORK'));
+
 // Pass language strings to JS via Joomla.Text (H1 — replaces addslashes inline)
 Text::script('COM_J2COMMERCE_CHECKOUT_ERROR_AGREE_TERMS');
 ?>
@@ -208,7 +220,7 @@ document.addEventListener('DOMContentLoaded', function() {
     var token = '<?php echo $token; ?>';
     var showShipping = <?php echo $this->showShipping ? 'true' : 'false'; ?>;
     var isLoggedIn = <?php echo $this->logged ? 'true' : 'false'; ?>;
-    var modifyText = '<?php echo Text::_('COM_J2COMMERCE_CHECKOUT_MODIFY', true); ?>';
+    var modifyText = <?php echo json_encode(Text::_('COM_J2COMMERCE_CHECKOUT_MODIFY')); ?>;
     var billingTask = isLoggedIn ? 'billingAddress' : null;
 
     // Utility: slide content up (hide)
@@ -317,7 +329,7 @@ document.addEventListener('DOMContentLoaded', function() {
         btn.type = 'button';
         btn.className = 'btn-close';
         btn.setAttribute('data-bs-dismiss', 'alert');
-        btn.setAttribute('aria-label', '<?php echo Text::_('JCLOSE', true); ?>');
+        btn.setAttribute('aria-label', <?php echo json_encode(Text::_('JCLOSE')); ?>);
         div.appendChild(btn);
         container.prepend(div);
         div.setAttribute('tabindex', '-1');
@@ -365,6 +377,21 @@ document.addEventListener('DOMContentLoaded', function() {
             var anchor = field.parentNode;
             anchor.parentNode.insertBefore(span, anchor.nextSibling);
         }
+    }
+
+    // Accessibility: scroll to and focus the first invalid field in a container.
+    // Called after field errors are painted so mobile users are not left guessing
+    // which field failed. Native form controls are focusable without tabindex.
+    function scrollToFirstError(container) {
+        if (!container) return;
+        var field = container.querySelector('[aria-invalid="true"]');
+        if (field) {
+            field.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            field.focus();
+            return;
+        }
+        var err = container.querySelector('.j2error');
+        if (err) err.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
 
     // Accessibility: move focus to element
@@ -535,14 +562,21 @@ document.addEventListener('DOMContentLoaded', function() {
                     console.error('Checkout step HTTP ' + response.status + ':', text.substring(0, 500));
                     content.setAttribute('aria-busy', 'false');
                     if (response.status === 403) {
-                        var expired = J2CommerceDom.el('div', {class: 'alert alert-warning', role: 'alert'}, 'Your session has expired. Please ');
-                        var reload = J2CommerceDom.el('a', {}, 'reload the page');
-                        reload.href = window.location.href;
-                        expired.append(reload, ' and try again.');
+                        var expired = J2CommerceDom.el('div', {class: 'alert alert-warning', role: 'alert'});
+                        var parts = <?php echo $sessionExpiredJs; ?>.split('%s');
+                        if (parts.length > 1) {
+                            var reload = J2CommerceDom.el('a', {}, <?php echo $reloadLinkTextJs; ?>);
+                            reload.href = window.location.href;
+                            expired.append(parts[0], reload, parts.slice(1).join('%s'));
+                        } else {
+                            // Translation dropped the placeholder — show the sentence whole
+                            // rather than losing the half that follows the link.
+                            expired.append(parts[0]);
+                        }
                         content.replaceChildren(expired);
                     } else {
                         var detail = extractErrorDetail(text);
-                        var failed = J2CommerceDom.el('div', {class: 'alert alert-danger', role: 'alert'}, 'Server error (' + response.status + '). Please try again.');
+                        var failed = J2CommerceDom.el('div', {class: 'alert alert-danger', role: 'alert'}, <?php echo $serverErrorJs; ?>.replace('%s', response.status));
                         if (detail) {
                             failed.appendChild(J2CommerceDom.el('small', {class: 'd-block mt-1 text-danger-emphasis'}, detail));
                         }
@@ -565,7 +599,7 @@ document.addEventListener('DOMContentLoaded', function() {
         .catch(function(error) {
             console.error('Checkout network error:', error);
             content.setAttribute('aria-busy', 'false');
-            content.replaceChildren(J2CommerceDom.el('div', {class: 'alert alert-danger', role: 'alert'}, 'Unable to connect to the server. Please check your connection and try again.'));
+            content.replaceChildren(J2CommerceDom.el('div', {class: 'alert alert-danger', role: 'alert'}, <?php echo $networkErrorJs; ?>));
         });
     }
 
@@ -617,24 +651,24 @@ document.addEventListener('DOMContentLoaded', function() {
                     console.error('Checkout HTTP ' + response.status + ':', text.substring(0, 500));
                     var detail = extractErrorDetail(text);
                     if (response.status === 403) {
-                        return { error: { warning: 'Your session has expired. Please reload the page and try again.' }, _detail: detail };
+                        return { error: { warning: <?php echo $sessionExpiredFlatJs; ?> }, _detail: detail };
                     }
-                    return { error: { warning: 'Server error (' + response.status + '). Please try again.' }, _detail: detail };
+                    return { error: { warning: <?php echo $serverErrorJs; ?>.replace('%s', response.status) }, _detail: detail };
                 }
                 try {
                     return JSON.parse(text);
                 } catch (e) {
                     console.error('Checkout JSON parse error:', text.substring(0, 500));
                     if (text.indexOf('<!DOCTYPE') !== -1 || text.indexOf('<html') !== -1) {
-                        return { error: { warning: 'Your session has expired. Please reload the page and try again.' } };
+                        return { error: { warning: <?php echo $sessionExpiredFlatJs; ?> } };
                     }
-                    return { error: { warning: 'Unexpected server response. Please reload the page and try again.' } };
+                    return { error: { warning: <?php echo $unexpectedFlatJs; ?> } };
                 }
             });
         })
         .catch(function(error) {
             console.error('Checkout network error:', error);
-            return { error: { warning: 'Unable to connect to the server. Please check your connection and try again.' } };
+            return { error: { warning: <?php echo $networkErrorJs; ?> } };
         });
     }
 
@@ -712,9 +746,9 @@ document.addEventListener('DOMContentLoaded', function() {
         var billingHeading = document.querySelector('#billing-address .checkout-heading span');
         if (!billingHeading) return;
         if (e.target.value === 'register') {
-            billingHeading.textContent = '<?php echo Text::_('COM_J2COMMERCE_CHECKOUT_ACCOUNT', true); ?>';
+            billingHeading.textContent = <?php echo json_encode(Text::_('COM_J2COMMERCE_CHECKOUT_ACCOUNT')); ?>;
         } else {
-            billingHeading.textContent = '<?php echo Text::_('COM_J2COMMERCE_CHECKOUT_BILLING_ADDRESS', true); ?>';
+            billingHeading.textContent = <?php echo json_encode(Text::_('COM_J2COMMERCE_CHECKOUT_BILLING_ADDRESS')); ?>;
         }
     });
 
@@ -737,7 +771,7 @@ document.addEventListener('DOMContentLoaded', function() {
             addEditLink('checkout');
             initCountryZoneFields(getContent('billing-address'));
             focusElement('#billing-address .checkout-heading');
-            announceToScreenReader('<?php echo Text::_('COM_J2COMMERCE_CHECKOUT_BILLING_ADDRESS', true); ?>');
+            announceToScreenReader(<?php echo json_encode(Text::_('COM_J2COMMERCE_CHECKOUT_BILLING_ADDRESS')); ?>);
         });
     });
 
@@ -796,6 +830,7 @@ document.addEventListener('DOMContentLoaded', function() {
                         showFieldError(getContent('billing-address'), key, json.error[key]);
                     }
                 });
+                scrollToFirstError(getContent('billing-address'));
             } else {
                 // After successful registration the user is now logged in,
                 // so switch to the billingAddress task which loads saved
@@ -827,6 +862,7 @@ document.addEventListener('DOMContentLoaded', function() {
                         showFieldError(getContent('billing-address'), key, json.error[key]);
                     }
                 });
+                scrollToFirstError(getContent('billing-address'));
             } else {
                 advanceFromBilling();
             }
@@ -934,7 +970,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 addEditLink('custom-steps-after-billing');
                 initCountryZoneFields(getContent('shipping-address'));
                 focusElement('#shipping-address .checkout-heading');
-                announceToScreenReader('<?php echo Text::_('COM_J2COMMERCE_CHECKOUT_SHIPPING_ADDRESS', true); ?>');
+                announceToScreenReader(<?php echo json_encode(Text::_('COM_J2COMMERCE_CHECKOUT_SHIPPING_ADDRESS')); ?>);
             });
         } else {
             var shipEl = document.getElementById('shipping-address');
@@ -964,6 +1000,7 @@ document.addEventListener('DOMContentLoaded', function() {
                         showFieldError(getContent('billing-address'), key, json.error[key]);
                     }
                 });
+                scrollToFirstError(getContent('billing-address'));
             } else {
                 advanceFromBilling();
             }
@@ -991,6 +1028,7 @@ document.addEventListener('DOMContentLoaded', function() {
                         showFieldError(getContent('shipping-address'), key, json.error[key]);
                     }
                 });
+                scrollToFirstError(getContent('shipping-address'));
             } else {
                 advanceFromShipping();
                 // Refresh shipping address display
@@ -1026,6 +1064,7 @@ document.addEventListener('DOMContentLoaded', function() {
                         showFieldError(getContent('shipping-address'), key, json.error[key]);
                     }
                 });
+                scrollToFirstError(getContent('shipping-address'));
             } else {
                 advanceFromShipping();
             }
@@ -1058,7 +1097,7 @@ document.addEventListener('DOMContentLoaded', function() {
             addEditLink('custom-steps-before-payment');
             autoSelectFirstShipping();
             focusElement('#shipping-payment-method .checkout-heading');
-            announceToScreenReader('<?php echo Text::_('COM_J2COMMERCE_CHECKOUT_SHIPPING_PAYMENT_METHOD', true); ?>');
+            announceToScreenReader(<?php echo json_encode(Text::_('COM_J2COMMERCE_CHECKOUT_SHIPPING_PAYMENT_METHOD')); ?>);
         });
     }
 
@@ -1083,7 +1122,7 @@ document.addEventListener('DOMContentLoaded', function() {
             addEditLink('shipping-payment-method');
             addEditLink('custom-steps-before-confirm');
             focusElement('#confirm .checkout-heading');
-            announceToScreenReader('<?php echo Text::_('COM_J2COMMERCE_CHECKOUT_CONFIRM', true); ?>');
+            announceToScreenReader(<?php echo json_encode(Text::_('COM_J2COMMERCE_CHECKOUT_CONFIRM')); ?>);
         });
     }
 
@@ -1125,6 +1164,7 @@ document.addEventListener('DOMContentLoaded', function() {
                         showFieldError(content, key, json.error[key]);
                     }
                 });
+                scrollToFirstError(content);
             } else {
                 refreshSidecart();
                 if (section && section._onComplete) {
@@ -1164,6 +1204,7 @@ document.addEventListener('DOMContentLoaded', function() {
                         showFieldError(getContent('shipping-payment-method'), key, json.error[key]);
                     }
                 });
+                scrollToFirstError(getContent('shipping-payment-method'));
             } else {
                 advanceToConfirm();
             }
@@ -1225,16 +1266,16 @@ document.addEventListener('DOMContentLoaded', function() {
             return response.text().then(function(text) {
                 if (!response.ok) {
                     console.error('Payment HTTP ' + response.status + ':', text.substring(0, 500));
-                    return { error: 'Server error (' + response.status + '). Please try again.', _detail: extractErrorDetail(text) };
+                    return { error: <?php echo $serverErrorJs; ?>.replace('%s', response.status), _detail: extractErrorDetail(text) };
                 }
                 try {
                     return JSON.parse(text);
                 } catch (e) {
                     console.error('Payment JSON parse error:', text.substring(0, 500));
                     if (text.indexOf('<!DOCTYPE') !== -1 || text.indexOf('<html') !== -1) {
-                        return { error: 'Your session has expired. Please reload the page and try again.' };
+                        return { error: <?php echo $sessionExpiredFlatJs; ?> };
                     }
-                    return { error: 'Unexpected server response. Please reload the page and try again.' };
+                    return { error: <?php echo $unexpectedFlatJs; ?> };
                 }
             });
         })
@@ -1248,6 +1289,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 var confirmContent = document.getElementById('confirm') && document.getElementById('confirm').querySelector('.checkout-content');
                 if (json.error.tos_check) {
                     showFieldError(confirmContent || form, 'tos_check', json.error.tos_check);
+                    scrollToFirstError(confirmContent || form);
                     btn.disabled = false;
                 } else {
                     var msg = typeof json.error === 'string' ? json.error : Object.values(json.error).join(', ');
@@ -1271,7 +1313,7 @@ document.addEventListener('DOMContentLoaded', function() {
             console.error('Payment network error:', err);
             hideLoading(btn);
             btn.disabled = false;
-            showWarning(form, 'Unable to connect to the server. Please check your connection and try again.');
+            showWarning(form, <?php echo $networkErrorJs; ?>);
         });
     }
 
@@ -1437,7 +1479,7 @@ document.addEventListener('DOMContentLoaded', function() {
     document.addEventListener('shown.bs.collapse', function(e) {
         if (e.target.id === 'checkoutSidecartCollapse') {
             var txt = document.querySelector('.j2commerce-sidecart-toggle-text');
-            if (txt) txt.textContent = '<?php echo Text::_('COM_J2COMMERCE_HIDE_ORDER_SUMMARY', true); ?>';
+            if (txt) txt.textContent = <?php echo json_encode(Text::_('COM_J2COMMERCE_HIDE_ORDER_SUMMARY')); ?>;
             var chevron = document.querySelector('.j2commerce-sidecart-chevron');
             if (chevron) chevron.style.transform = 'rotate(180deg)';
         }
@@ -1445,7 +1487,7 @@ document.addEventListener('DOMContentLoaded', function() {
     document.addEventListener('hidden.bs.collapse', function(e) {
         if (e.target.id === 'checkoutSidecartCollapse') {
             var txt = document.querySelector('.j2commerce-sidecart-toggle-text');
-            if (txt) txt.textContent = '<?php echo Text::_('COM_J2COMMERCE_SHOW_ORDER_SUMMARY', true); ?>';
+            if (txt) txt.textContent = <?php echo json_encode(Text::_('COM_J2COMMERCE_SHOW_ORDER_SUMMARY')); ?>;
             var chevron = document.querySelector('.j2commerce-sidecart-chevron');
             if (chevron) chevron.style.transform = '';
         }
@@ -1481,7 +1523,7 @@ document.addEventListener('DOMContentLoaded', function() {
     // Guest only - skip checkout options, go straight to guest billing
     (function() {
         var billingHeading = document.querySelector('#billing-address .checkout-heading span');
-        if (billingHeading) billingHeading.textContent = '<?php echo Text::_('COM_J2COMMERCE_CHECKOUT_BILLING_ADDRESS', true); ?>';
+        if (billingHeading) billingHeading.textContent = <?php echo json_encode(Text::_('COM_J2COMMERCE_CHECKOUT_BILLING_ADDRESS')); ?>;
         document.getElementById('checkout').style.display = 'none';
         fetchStep('guest', 'billing-address').then(function() {
             slideDown(getContent('billing-address'));

@@ -15,6 +15,7 @@ namespace J2Commerce\Component\J2commerce\Administrator\Helper;
 \defined('_JEXEC') or die;
 
 use J2Commerce\Component\J2commerce\Site\Helper\RouteHelper;
+use Joomla\CMS\Application\CMSWebApplicationInterface;
 use Joomla\CMS\Factory;
 use Joomla\CMS\Language\Text;
 use Joomla\CMS\Layout\LayoutHelper;
@@ -686,7 +687,18 @@ class ProductHelper
                 $variantCount++;
             }
         }
-        $product->variant_pagination = new \Joomla\CMS\Pagination\Pagination($variantCount, 0, 20);
+
+        // Pagination is presentation state, and its constructor resolves the application's
+        // router. A console application has none registered, so building one here made this
+        // hydrator - which CLI, cron, queue workers and the API all go through - throw before
+        // it could return. Left null off the web; every reader takes only ->total and already
+        // defaults it. ConsoleApplication implements CMSApplicationInterface but not this one,
+        // while ApiApplication extends CMSApplication and so keeps its pagination.
+        $isWebApplication = Factory::getApplication() instanceof CMSWebApplicationInterface;
+
+        $product->variant_pagination = $isWebApplication
+            ? new \Joomla\CMS\Pagination\Pagination($variantCount, 0, 20)
+            : null;
 
         // Add pricing (based on master variant and default quantity of 1)
         // Default display quantity used for pricing calculations
@@ -717,7 +729,9 @@ class ProductHelper
 
         // Product filter pagination (for product filter listings)
         $filterCount                       = self::getProductFilterCount($productId);
-        $product->productfilter_pagination = new \Joomla\CMS\Pagination\Pagination($filterCount, 0, 10);
+        $product->productfilter_pagination = $isWebApplication
+            ? new \Joomla\CMS\Pagination\Pagination($filterCount, 0, 10)
+            : null;
 
         // Populate productfilter_ids from junction table (not from deprecated products column)
         $product->productfilter_ids = implode(',', self::getProductFilterIds($productId));
@@ -1277,7 +1291,7 @@ class ProductHelper
      */
     public static function getVariantByOptions(array $productOptions, int $productId): ?object
     {
-        if (empty($productOptions)) {
+        if (empty($productOptions) || $productId < 1) {
             return null;
         }
 
@@ -1322,7 +1336,13 @@ class ProductHelper
                     $db->quoteName('a.j2commerce_variant_id') . ' = ' . $db->quoteName('q.variant_id')
                 )
                 ->where($db->quoteName('a.j2commerce_variant_id') . ' = :variantId')
-                ->bind(':variantId', $row->variant_id, ParameterType::INTEGER);
+                // $productId was accepted but never applied. product_optionvalue_ids is a bare
+                // sorted id set with no product column of its own, so an option combination that
+                // exists under a different product resolved to that product's variant — and the
+                // caller then priced the line from it. Constrain the match to the product asked for.
+                ->where($db->quoteName('a.product_id') . ' = :productId')
+                ->bind(':variantId', $row->variant_id, ParameterType::INTEGER)
+                ->bind(':productId', $productId, ParameterType::INTEGER);
 
             $db->setQuery($variantQuery);
             $variant = $db->loadObject();
@@ -2407,7 +2427,11 @@ class ProductHelper
     }
 
     /**
-     * Get total quantity in cart for a variant.
+     * Get total quantity held in live baskets for a variant.
+     *
+     * Counts only rows belonging to an existing cart of type 'cart' that has been touched
+     * within the cart expiry term — wishlists, abandoned baskets and rows whose parent cart
+     * was deleted do not reserve stock.
      *
      * @param   int  $variantId  The variant ID.
      * @param   int  $cartId     Optional cart ID.
@@ -2422,15 +2446,32 @@ class ProductHelper
             return 0;
         }
 
-        $db    = self::getDatabase();
+        $db       = self::getDatabase();
+        $cartType = 'cart';
+
+        // CartHelper writes modified_on via Factory::getDate()->toSql(), so the cutoff is UTC too.
+        $cutoff = Factory::getDate('now -' . ConfigHelper::getCartExpiryDays() . ' days')->toSql();
+
         $query = $db->getQuery(true)
-            ->select('SUM(' . $db->quoteName('product_qty') . ') AS total_cart_qty')
-            ->from($db->quoteName('#__j2commerce_cartitems'))
-            ->where($db->quoteName('variant_id') . ' = :variantId')
-            ->bind(':variantId', $variantId, ParameterType::INTEGER);
+            ->select('SUM(' . $db->quoteName('ci.product_qty') . ') AS total_cart_qty')
+            ->from($db->quoteName('#__j2commerce_cartitems', 'ci'))
+            // Inner join drops rows whose parent cart record is gone — no shopper can reach
+            // those, so they must not hold stock.
+            ->innerJoin(
+                $db->quoteName('#__j2commerce_carts', 'c')
+                . ' ON ' . $db->quoteName('c.j2commerce_cart_id') . ' = ' . $db->quoteName('ci.cart_id')
+            )
+            ->where($db->quoteName('ci.variant_id') . ' = :variantId')
+            // A wishlist is an intent to buy later, not a hold on stock.
+            ->where($db->quoteName('c.cart_type') . ' = :cartType')
+            // Past the cart expiry term a basket is abandoned and releases what it held.
+            ->where($db->quoteName('c.modified_on') . ' >= :cutoff')
+            ->bind(':variantId', $variantId, ParameterType::INTEGER)
+            ->bind(':cartType', $cartType)
+            ->bind(':cutoff', $cutoff);
 
         if ($cartId > 0) {
-            $query->where($db->quoteName('cart_id') . ' = :cartId')
+            $query->where($db->quoteName('ci.cart_id') . ' = :cartId')
                 ->bind(':cartId', $cartId, ParameterType::INTEGER);
         }
 
@@ -4070,10 +4111,15 @@ class ProductHelper
         $db    = self::getDatabase();
         $query = $db->getQuery(true);
 
+        // The sibling helper getSiblingCategoryIds() already filters on view level; without
+        // the same predicate here the filter bar names categories the visitor cannot open.
+        $groups = Factory::getApplication()->getIdentity()->getAuthorisedViewLevels();
+
         $query->select($db->quoteName(['id', 'title', 'level', 'parent_id']))
             ->from($db->quoteName('#__categories'))
             ->where($db->quoteName('extension') . ' = ' . $db->quote('com_content'))
             ->where($db->quoteName('published') . ' = 1')
+            ->whereIn($db->quoteName('access'), $groups)
             ->order($db->quoteName('lft') . ' ASC');
 
         // If parent categories specified, filter to those and their children

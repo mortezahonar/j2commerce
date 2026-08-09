@@ -993,6 +993,44 @@ class CartOrder
     }
 
     /**
+     * Order shipping rates for display. With auto-apply on, the cheapest rate leads.
+     * With it off, the plugin dispatch order (#__extensions.ordering) is preserved
+     * between plugins and the rates one plugin returned are priced ascending inside
+     * its own block. Either way the first entry is the default selection.
+     *
+     * @param   array<int, array<string, mixed>>  $rates      Rates from GetShippingRates.
+     * @param   bool                              $autoApply  Value of auto_apply_shipping_rate.
+     *
+     * @return  array<int, array<string, mixed>>
+     *
+     * @since   6.1.0
+     */
+    public static function sortShippingRates(array $rates, bool $autoApply): array
+    {
+        $byPrice = static fn (array $a, array $b): int => ((float) ($a['price'] ?? 0)) <=> ((float) ($b['price'] ?? 0));
+
+        if ($autoApply) {
+            usort($rates, $byPrice);
+
+            return $rates;
+        }
+
+        $groups = [];
+
+        foreach ($rates as $rate) {
+            $groups[(string) ($rate['element'] ?? '')][] = $rate;
+        }
+
+        foreach ($groups as &$group) {
+            usort($group, $byPrice);
+        }
+
+        unset($group);
+
+        return array_merge(...array_values($groups));
+    }
+
+    /**
      * Canonical empty shipping_values array (no method selected).
      *
      * @return  array<string, mixed>
@@ -1121,12 +1159,18 @@ class CartOrder
         return $this->orderpayment_type;
     }
 
+    /**
+     * Fee tax is attributed to order_surcharge, not order_tax: order_tax is the
+     * product tax (it mirrors SUM(orderitem_tax) and the #__j2commerce_ordertaxes
+     * rows), so folding fee tax into it would be dropped by the first admin
+     * recalculation. Same treatment shipping tax gets — see loadShipping().
+     */
     protected function loadFees(): void
     {
         $fees = $this->get_fees();
 
         foreach ($fees as $fee) {
-            $this->order_surcharge += (float) $fee->amount;
+            $this->order_surcharge += (float) $fee->amount + (float) $fee->tax;
             $this->order_total += (float) $fee->amount + (float) $fee->tax;
         }
     }
@@ -1147,7 +1191,7 @@ class CartOrder
         // Roll back ALL prior payment_* fees from the live total + drop from session
         foreach ($fees as $key => $fee) {
             if (str_starts_with((string) $key, 'payment_')) {
-                $this->order_surcharge -= (float) ($fee['amount'] ?? 0);
+                $this->order_surcharge -= (float) ($fee['amount'] ?? 0) + (float) ($fee['tax'] ?? 0);
                 $this->order_total -= (float) ($fee['amount'] ?? 0) + (float) ($fee['tax'] ?? 0);
                 unset($fees[$key]);
             }
@@ -1167,7 +1211,7 @@ class CartOrder
 
         foreach ($this->get_fees() as $fee) {
             if (($fee->plugin ?? '') === $key) {
-                $this->order_surcharge += (float) $fee->amount;
+                $this->order_surcharge += (float) $fee->amount + (float) $fee->tax;
                 $this->order_total += (float) $fee->amount + (float) $fee->tax;
                 break;
             }

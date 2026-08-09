@@ -19,6 +19,7 @@ use J2Commerce\Component\J2commerce\Administrator\Helper\J2CommerceHelper;
 use J2Commerce\Component\J2commerce\Administrator\SetupGuide\SetupGuideHelper;
 use J2Commerce\Component\J2commerce\Site\Context\AdminOrderCheckoutContext;
 use J2Commerce\Component\J2commerce\Site\Event\CheckoutContextEvent;
+use J2Commerce\Component\J2commerce\Site\Helper\ProductVisibilityHelper;
 use Joomla\CMS\Access\Access;
 use Joomla\CMS\Cache\CacheControllerFactoryInterface;
 use Joomla\CMS\Component\ComponentHelper;
@@ -846,6 +847,11 @@ class J2Commerce extends CMSPlugin implements SubscriberInterface
             // Silently fail if cart table doesn't exist yet or other DB error
             // This allows the plugin to work during initial migration
         }
+
+        // The unavailable-item list CartModel::getItems() keeps was built against the
+        // guest's view levels, and logging in widens them. Drop it so the loader decides
+        // afresh rather than suppressing a message this identity has not been shown.
+        $this->getApplication()->getSession()->clear('unavailable_announced', 'j2commerce');
     }
 
     /**
@@ -1446,6 +1452,17 @@ class J2Commerce extends CMSPlugin implements SubscriberInterface
         if ($product === null) {
             if ($debugMode) {
                 $document->addCustomTag('<!-- ' . implode(' | ', $debugInfo) . ' -->');
+            }
+
+            return;
+        }
+
+        // The context comes from request input, so it also resolves on the error
+        // document a rejected product renders — describe only what the visitor
+        // is allowed to see.
+        if (!ProductVisibilityHelper::isViewable((int) ($product->j2commerce_product_id ?? 0))) {
+            if ($debugMode) {
+                $document->addCustomTag('<!-- ' . implode(' | ', $debugInfo) . ' | Not viewable, skipping -->');
             }
 
             return;
