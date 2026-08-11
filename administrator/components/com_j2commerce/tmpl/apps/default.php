@@ -149,14 +149,14 @@ $return = rawurlencode($encodedReturn);
                                                     <span class="d-none d-lg-inline-block d-md-block">
                                             <?php endif;?>
                                             <?php if($imagePath):?>
-                                                <img src="<?php echo $imagePath; ?>" class="img-fluid j2commerce-app-image" alt="<?php echo $item->display_name; ?>"/>
+                                                <img src="<?php echo $this->escape($imagePath); ?>" class="img-fluid j2commerce-app-image" alt="<?php echo $this->escape($item->display_name); ?>"/>
                                             <?php elseif (file_exists(JPATH_SITE . '/plugins/' . $item->folder . '/' . $item->element . '/images/' . $item->element . '.png')): ?>
-                                                <img src="<?php echo Uri::root(true) . '/plugins/' . $item->folder . '/' . $item->element . '/images/' . $item->element . '.png'; ?>" class="img-fluid j2commerce-app-image" alt="<?php echo $item->display_name; ?>"/>
+                                                <img src="<?php echo $this->escape(Uri::root(true) . '/plugins/' . $item->folder . '/' . $item->element . '/images/' . $item->element . '.png'); ?>" class="img-fluid j2commerce-app-image" alt="<?php echo $this->escape($item->display_name); ?>"/>
                                             <?php elseif (file_exists(JPATH_SITE . '/media/j2commerce/images/' . $item->element . '.png')): ?>
-                                                <img src="<?php echo Uri::root(true) . '/media/j2commerce/images/' . $item->element . '.png'; ?>" class="img-fluid j2commerce-app-image" alt="<?php echo $item->display_name; ?>"/>
+                                                <img src="<?php echo $this->escape(Uri::root(true) . '/media/j2commerce/images/' . $item->element . '.png'); ?>" class="img-fluid j2commerce-app-image" alt="<?php echo $this->escape($item->display_name); ?>"/>
 
                                             <?php else: ?>
-                                                <img src="<?php echo Uri::root(true) . '/media/com_j2commerce/images/default_app_j2commerce.webp'; ?>" class="img-fluid j2commerce-app-image" alt="<?php echo $item->display_name; ?>"/>
+                                                <img src="<?php echo $this->escape(Uri::root(true) . '/media/com_j2commerce/images/default_app_j2commerce.webp'); ?>" class="img-fluid j2commerce-app-image" alt="<?php echo $this->escape($item->display_name); ?>"/>
                                             <?php endif; ?>
                                         <?php if ($item->enabled): ?>
                                             </a>
@@ -166,6 +166,9 @@ $return = rawurlencode($encodedReturn);
                                         </div>
                                         <div class="flex-grow-1 ms-lg-3 mt-0 mt-lg-0">
                                             <div>
+                                                <?php if (!empty($item->checked_out)): ?>
+                                                    <?php echo J2htmlHelper::checkedOut($i, $item->editor, $item->checked_out_time, 'apps.', $canCheckin); ?>
+                                                <?php endif; ?>
                                                 <?php if ($item->enabled): ?>
                                                     <a href="<?php echo Route::_($item->edit_link . '&return=' . $return); ?>"><?php echo $item->display_name; ?></a>
                                                 <?php else: ?>

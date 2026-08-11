@@ -122,29 +122,37 @@ document.addEventListener('DOMContentLoaded', function() {
      */
     async function loadZones(countryId, selectedZoneId = 0) {
         // Show loading state
-        zoneSelect.innerHTML = '<option value=""><?php echo Text::_('COM_J2COMMERCE_LOADING', true); ?></option>';
+        zoneSelect.replaceChildren(new Option(<?php echo json_encode(Text::_('COM_J2COMMERCE_LOADING')); ?>, ''));
         zoneSelect.disabled = true;
 
         if (!countryId || countryId === '0' || countryId === '') {
-            zoneSelect.innerHTML = '<option value=""><?php echo Text::_('COM_J2COMMERCE_SELECT_ZONE', true); ?></option>';
+            zoneSelect.replaceChildren(new Option(<?php echo json_encode(Text::_('COM_J2COMMERCE_SELECT_ZONE')); ?>, ''));
             zoneSelect.disabled = false;
             return;
         }
 
         try {
-            const url = 'index.php?option=com_j2commerce&task=manufacturer.getZones&country_id=' + countryId + '&zone_id=' + selectedZoneId;
+            const url = 'index.php?option=com_j2commerce&task=ajax.getZones&response=json&country_id=' + countryId + '&zone_id=' + selectedZoneId;
             const response = await fetch(url);
 
             if (!response.ok) {
                 throw new Error('Network response was not ok');
             }
 
-            const html = await response.text();
-            zoneSelect.innerHTML = html;
+            const data = await response.json();
+            const options = [new Option(data.placeholder, '')];
+
+            (data.zones || []).forEach(function (zone) {
+                const option = new Option(zone.name, zone.id);
+                option.selected = String(zone.id) === String(data.selected);
+                options.push(option);
+            });
+
+            zoneSelect.replaceChildren(...options);
             zoneSelect.disabled = false;
         } catch (error) {
             console.error('Error loading zones:', error);
-            zoneSelect.innerHTML = '<option value=""><?php echo Text::_('COM_J2COMMERCE_SELECT_ZONE', true); ?></option>';
+            zoneSelect.replaceChildren(new Option(<?php echo json_encode(Text::_('COM_J2COMMERCE_SELECT_ZONE')); ?>, ''));
             zoneSelect.disabled = false;
         }
     }

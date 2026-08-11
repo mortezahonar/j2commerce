@@ -150,16 +150,16 @@ Text::script('COM_J2COMMERCE_INVENTORY_BATCH_NO_FIELDS');
                                 <?php if ($isVariantProduct) : ?>
                                     <!-- Product has variants - empty cells for quantity, stock management, stock status, and actions -->
                                     <td class="text-center">
-                                        <span class="text-muted">—</span>
+                                        <span class="text-body-secondary">—</span>
                                     </td>
                                     <td class="text-center">
-                                        <span class="text-muted">—</span>
+                                        <span class="text-body-secondary">—</span>
                                     </td>
                                     <td class="text-center">
-                                        <span class="text-muted">—</span>
+                                        <span class="text-body-secondary">—</span>
                                     </td>
                                     <td class="text-center">
-                                        <span class="text-muted">—</span>
+                                        <span class="text-body-secondary">—</span>
                                     </td>
                                 <?php else : ?>
                                     <!-- Single variant product - show regular fields -->
@@ -378,7 +378,7 @@ Text::script('COM_J2COMMERCE_INVENTORY_BATCH_NO_FIELDS');
     <?php // Must stay inside the form: for popupType=inline, joomla-dialog appends the dialog to
           // this template's parentElement, so a template outside the form leaves the batch fields
           // outside it too and they are never submitted. ?>
-    <?php if (!empty($this->items)) : ?>
+    <?php if ($this->canBatch && !empty($this->items)) : ?>
         <template id="joomla-dialog-batch"><?php echo $this->loadTemplate('batch_body'); ?></template>
     <?php endif; ?>
 </form>

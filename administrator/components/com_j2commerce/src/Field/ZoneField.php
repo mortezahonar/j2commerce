@@ -165,8 +165,10 @@ class ZoneField extends ListField
         $zoneFieldId    = $this->id;
 
         // Get language strings (JS-safe via htmlspecialchars)
-        $loadingText    = htmlspecialchars(Text::_('COM_J2COMMERCE_LOADING'), ENT_QUOTES, 'UTF-8');
-        $selectZoneText = htmlspecialchars(Text::sprintf('COM_J2COMMERCE_SELECT_PLACEHOLDER', Text::_('COM_J2COMMERCE_ZONE')), ENT_QUOTES, 'UTF-8');
+        // JSON-encoded: these are read as JavaScript string literals below and set
+        // as option text, so HTML escaping would surface entities to the shopper.
+        $loadingText    = json_encode(Text::_('COM_J2COMMERCE_LOADING'));
+        $selectZoneText = json_encode(Text::sprintf('COM_J2COMMERCE_SELECT_PLACEHOLDER', Text::_('COM_J2COMMERCE_ZONE')));
 
         $script = <<<JS
 <script>
@@ -189,29 +191,37 @@ document.addEventListener('DOMContentLoaded', function() {
      */
     async function loadZones(countryId, selectedZoneId = 0) {
         // Show loading state
-        zoneSelect.innerHTML = '<option value="">{$loadingText}</option>';
+        zoneSelect.replaceChildren(new Option({$loadingText}, ''));
         zoneSelect.disabled = true;
 
         if (!countryId || countryId === '0' || countryId === '') {
-            zoneSelect.innerHTML = '<option value="">{$selectZoneText}</option>';
+            zoneSelect.replaceChildren(new Option({$selectZoneText}, ''));
             zoneSelect.disabled = false;
             return;
         }
 
         try {
-            const url = 'index.php?option=com_j2commerce&task=ajax.getZones&country_id=' + countryId + '&zone_id=' + selectedZoneId;
+            const url = 'index.php?option=com_j2commerce&task=ajax.getZones&response=json&country_id=' + countryId + '&zone_id=' + selectedZoneId;
             const response = await fetch(url);
 
             if (!response.ok) {
                 throw new Error('Network response was not ok');
             }
 
-            const html = await response.text();
-            zoneSelect.innerHTML = html;
+            const data = await response.json();
+            const options = [new Option(data.placeholder, '')];
+
+            (data.zones || []).forEach(function (zone) {
+                const option = new Option(zone.name, zone.id);
+                option.selected = String(zone.id) === String(data.selected);
+                options.push(option);
+            });
+
+            zoneSelect.replaceChildren(...options);
             zoneSelect.disabled = false;
         } catch (error) {
             console.error('Error loading zones:', error);
-            zoneSelect.innerHTML = '<option value="">{$selectZoneText}</option>';
+            zoneSelect.replaceChildren(new Option({$selectZoneText}, ''));
             zoneSelect.disabled = false;
         }
     }

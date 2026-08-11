@@ -1,3 +1,21 @@
+// A filter group renders its values as checkboxes, colour swatches, radios or a <select>,
+// whichever the group is set to. The value carrier is an <input> in the first three and an
+// <option> in the last, and both answer :checked — so every selector in this file is shared
+// and only the property differs. An <option> has no .checked at all; writing one silently
+// creates an expando and selects nothing, which is what these two exist to prevent.
+const pfilterPicked = el => (el.tagName === 'OPTION' ? el.selected : el.checked);
+const pfilterPick = (el, on) => {
+    if (el.tagName === 'OPTION') {
+        el.selected = on;
+    } else {
+        el.checked = on;
+    }
+};
+
+// The empty value is the "Any" control a single-value group offers as its reset. It is a real
+// picked control, so it has to be kept out of every selection, count and chip.
+const pfilterValued = el => el.value !== '';
+
 class J2CommerceFilters {
     constructor(options = {}) {
         this.productContainer = document.querySelector(options.productContainer || '.j2commerce-product-list');
@@ -28,6 +46,84 @@ class J2CommerceFilters {
         this.bindActiveFilterTiles();
         this.bindMobileFooter();
         this.buildActiveFilterTiles();
+        this.bindHistory();
+    }
+
+    bindHistory() {
+        // Seed the entry the page loaded on. Without this, stepping back to the landing
+        // state arrives with a null state and the handler has nothing to restore from.
+        window.history.replaceState(this.captureState(this.currentStart()), '', window.location.href);
+
+        window.addEventListener('popstate', (event) => {
+            if (!event.state || !event.state.j2commerce) return;
+
+            this.restoreState(event.state);
+            this.applyFilters(event.state.start || 0, true);
+        });
+    }
+
+    currentStart() {
+        const params = new URLSearchParams(window.location.search);
+
+        return parseInt(params.get('start') || params.get('limitstart') || '0', 10) || 0;
+    }
+
+    /** Snapshot of the controls, stored on the history entry so Back restores without re-parsing the URL. */
+    captureState(limitstart = 0) {
+        const checkedValues = selector => [...new Set(
+            Array.from(document.querySelectorAll(`${selector}:checked`)).filter(pfilterValued).map(cb => cb.value)
+        )];
+
+        return {
+            j2commerce: true,
+            brands: checkedValues('.j2commerce-brand-checkboxes'),
+            vendors: checkedValues('.j2commerce-vendor-checkboxes'),
+            pfilters: checkedValues('[class*="j2commerce-pfilter-checkboxes"]'),
+            search: document.getElementById('j2commerce-search')?.value || '',
+            sortby: document.getElementById('j2commerce-sortby')?.value || '',
+            priceFrom: document.getElementById('min_price_input')?.value || '',
+            priceTo: document.getElementById('max_price_input')?.value || '',
+            rangeMin: document.getElementById('j2commerce-range-min')?.value || '',
+            rangeMax: document.getElementById('j2commerce-range-max')?.value || '',
+            start: limitstart
+        };
+    }
+
+    restoreState(state) {
+        const applyChecked = (selector, wanted) => {
+            const values = new Set(wanted || []);
+            // Every matching control, so the mirrored mobile and desktop copies land together.
+            document.querySelectorAll(selector).forEach(cb => {
+                pfilterPick(cb, values.has(cb.value));
+            });
+        };
+
+        applyChecked('.j2commerce-brand-checkboxes', state.brands);
+        applyChecked('.j2commerce-vendor-checkboxes', state.vendors);
+        applyChecked('[class*="j2commerce-pfilter-checkboxes"]', state.pfilters);
+        this.syncAnyControls();
+
+        const searchInput = document.getElementById('j2commerce-search');
+        if (searchInput) searchInput.value = state.search || '';
+
+        const sortSelect = document.getElementById('j2commerce-sortby');
+        if (sortSelect) sortSelect.value = state.sortby || sortSelect.options[0]?.value || '';
+
+        const rangeMin = document.getElementById('j2commerce-range-min');
+        const rangeMax = document.getElementById('j2commerce-range-max');
+        if (rangeMin) rangeMin.value = state.rangeMin !== '' ? state.rangeMin : rangeMin.min;
+        if (rangeMax) rangeMax.value = state.rangeMax !== '' ? state.rangeMax : rangeMax.max;
+
+        // Same idiom as resetAllFilters(): non-bubbling so the sliderContainer delegation
+        // listener does not fire another filter run.
+        if (rangeMin) rangeMin.dispatchEvent(new Event('input', { bubbles: false }));
+
+        // updateDisplays() above rewrites the hidden inputs from the slider positions, so the
+        // recorded prices go back afterwards rather than before.
+        const minPriceInput = document.getElementById('min_price_input');
+        const maxPriceInput = document.getElementById('max_price_input');
+        if (minPriceInput) minPriceInput.value = state.priceFrom || '0';
+        if (maxPriceInput) maxPriceInput.value = state.priceTo || '0';
     }
 
     bindCheckboxFilters() {
@@ -45,6 +141,50 @@ class J2CommerceFilters {
                 });
             });
         });
+
+        // An <option> never fires change — the <select> around it does.
+        document.querySelectorAll('.j2commerce-pfilter-select').forEach(select => {
+            select.addEventListener('change', () => {
+                this.syncMirroredSelect(select);
+                this.debounce(() => this.applyFilters(), this.checkboxDebounce);
+            });
+        });
+    }
+
+    /** Re-pick the "Any" control of every single-value group that ended up with nothing picked. */
+    syncAnyControls() {
+        document.querySelectorAll('.j2commerce-productfilter-list').forEach(list => {
+            const controls = Array.from(list.querySelectorAll('[class*="j2commerce-pfilter-checkboxes"]'));
+            const anyControls = controls.filter(el => !pfilterValued(el));
+
+            if (anyControls.length === 0) {
+                return;
+            }
+
+            const picked = controls.some(el => pfilterValued(el) && pfilterPicked(el));
+
+            anyControls.forEach(el => pfilterPick(el, !picked));
+        });
+    }
+
+    syncMirroredSelect(source) {
+        // Every copy of one group carries the same per-group class, which is the only key that
+        // holds where the tag listing omits the group alias and all selects share a name.
+        const groupClass = Array.from(source.classList).find(name => name.startsWith('j2commerce-pfilter-select-'));
+
+        if (!groupClass) {
+            return;
+        }
+
+        const picked = new Set(Array.from(source.selectedOptions).map(option => option.value));
+
+        document.querySelectorAll('.' + groupClass).forEach(select => {
+            if (select === source) return;
+
+            Array.from(select.options).forEach(option => {
+                option.selected = picked.has(option.value);
+            });
+        });
     }
 
     syncMirroredCheckbox(source) {
@@ -57,8 +197,10 @@ class J2CommerceFilters {
             if (cb.value !== value) return;
             // If both have group alias, require it to match; otherwise fall back to value-only match
             if (groupAlias && cb.dataset.groupAlias && cb.dataset.groupAlias !== groupAlias) return;
-            cb.checked = source.checked;
+            pfilterPick(cb, pfilterPicked(source));
         });
+
+        this.syncAnyControls();
 
         // Also sync brand/vendor mirrors (no group alias needed — IDs are globally unique)
         if (source.classList.contains('j2commerce-brand-checkboxes')) {
@@ -178,7 +320,8 @@ class J2CommerceFilters {
             btn.addEventListener('click', () => {
                 const filterClass = btn.dataset.filterClass;
                 if (filterClass) {
-                    document.querySelectorAll('.' + filterClass).forEach(cb => cb.checked = false);
+                    document.querySelectorAll('.' + filterClass).forEach(cb => pfilterPick(cb, false));
+                    this.syncAnyControls();
                     this.applyFilters();
                 }
             });
@@ -221,6 +364,7 @@ class J2CommerceFilters {
 
         const productfilterIds = [...new Set(
             Array.from(document.querySelectorAll('[class*="j2commerce-pfilter-checkboxes"]:checked'))
+                .filter(pfilterValued)
                 .map(cb => cb.value)
         )];
         productfilterIds.forEach(id => data.append('productfilter_ids[]', id));
@@ -271,7 +415,7 @@ class J2CommerceFilters {
         return data;
     }
 
-    async applyFilters(limitstart = 0) {
+    async applyFilters(limitstart = 0, fromHistory = false) {
         if (!this.enabled) {
             this.fallbackSubmit();
             return;
@@ -300,8 +444,11 @@ class J2CommerceFilters {
                 throw new Error(result.message || 'Filter request failed');
             }
 
-            this.updateProducts(result.data || result);
-            this.updateUrl(data, limitstart);
+            const payload = result.data || result;
+
+            this.updateProducts(payload);
+            this.updateFilterCounts(payload.filterCounts);
+            this.updateUrl(data, limitstart, fromHistory);
             this.updateClearButtonVisibility();
             this.buildActiveFilterTiles();
 
@@ -311,6 +458,66 @@ class J2CommerceFilters {
         } finally {
             this.hideLoading();
         }
+    }
+
+    /**
+     * Re-point each sidebar value at the listing that just came back.
+     *
+     * The server sends counts only. The value list is a superset that ignores the current
+     * selection, so every checkbox the visitor could ever need is already in the page and
+     * this only has to update numbers and availability — the accordion stays where it was
+     * and focus is never torn out from under the keyboard.
+     */
+    updateFilterCounts(counts) {
+        if (!counts || typeof counts !== 'object') {
+            return;
+        }
+
+        document.querySelectorAll('[class*="j2commerce-pfilter-checkboxes"]').forEach(checkbox => {
+            // The "Any" control of a single-value group carries no value to count.
+            if (!pfilterValued(checkbox)) {
+                return;
+            }
+
+            const count = Number(counts[checkbox.value] ?? 0);
+
+            checkbox.dataset.count = String(count);
+
+            // A picked value stays operable at zero, or there is no way left to undo the
+            // selection that emptied the listing.
+            checkbox.disabled = count === 0 && !pfilterPicked(checkbox);
+
+            if (checkbox.tagName === 'OPTION') {
+                // An option has no room for a separate badge, so the count rides its text.
+                checkbox.textContent = `${checkbox.dataset.label ?? checkbox.textContent} (${count})`;
+
+                return;
+            }
+
+            const list = checkbox.closest('.j2commerce-productfilter-list');
+            const wrapper = list
+                ? Array.from(list.children).find(child => child.contains(checkbox))
+                : checkbox.parentElement;
+
+            wrapper?.classList.toggle('j2commerce-filter-unavailable', checkbox.disabled);
+
+            const badge = wrapper?.querySelector('.j2commerce-filter-count');
+
+            if (badge) {
+                badge.textContent = `(${count})`;
+            }
+        });
+
+        // A group with nothing left to offer is noise — fold the whole accordion item away.
+        document.querySelectorAll('.j2commerce-productfilter-list').forEach(list => {
+            const boxes = Array.from(list.querySelectorAll('[class*="j2commerce-pfilter-checkboxes"]'))
+                .filter(pfilterValued);
+            const item = list.closest('.accordion-item, li');
+
+            if (item && boxes.length) {
+                item.hidden = boxes.every(cb => cb.disabled);
+            }
+        });
     }
 
     updateProducts(data) {
@@ -388,7 +595,7 @@ class J2CommerceFilters {
         el.replaceChildren(document.createRange().createContextualFragment(str.replace(/%d/, total)));
     }
 
-    updateUrl(formData, limitstart) {
+    updateUrl(formData, limitstart, replace = false) {
         const params = new URLSearchParams();
 
         // Use comma-separated values for cleaner SEF-friendly URLs
@@ -407,6 +614,7 @@ class J2CommerceFilters {
         // Falls back to bare alias (or numeric value) when group alias is absent.
         const productfilterTokens = [...new Set(
             Array.from(document.querySelectorAll('[class*="j2commerce-pfilter-checkboxes"]:checked'))
+                .filter(pfilterValued)
                 .map(cb => {
                     const alias = cb.dataset.alias || cb.value;
                     const groupAlias = cb.dataset.groupAlias;
@@ -454,13 +662,25 @@ class J2CommerceFilters {
         // Keep the composite group:filter token readable as `?filters=caliber:9mm`.
         const queryString = params.toString().replace(/%2C/gi, ',').replace(/%3A/gi, ':');
         const newUrl = window.location.pathname + (queryString ? '?' + queryString : '');
-        window.history.replaceState({ j2commerce: true }, '', newUrl);
+        const state = this.captureState(limitstart);
+
+        // Replaying history, or landing on the URL we are already on: overwrite the current
+        // entry. Pushing an identical URL would cost the visitor a Back press that appears
+        // to do nothing.
+        if (replace || newUrl === window.location.pathname + window.location.search) {
+            window.history.replaceState(state, '', newUrl);
+
+            return;
+        }
+
+        window.history.pushState(state, '', newUrl);
     }
 
     resetAllFilters() {
         document.querySelectorAll('.j2commerce-brand-checkboxes').forEach(cb => cb.checked = false);
         document.querySelectorAll('.j2commerce-vendor-checkboxes').forEach(cb => cb.checked = false);
-        document.querySelectorAll('[class*="j2commerce-pfilter-checkboxes"]').forEach(cb => cb.checked = false);
+        document.querySelectorAll('[class*="j2commerce-pfilter-checkboxes"]').forEach(cb => pfilterPick(cb, false));
+        this.syncAnyControls();
 
         const searchInput = document.getElementById('j2commerce-search');
         if (searchInput) searchInput.value = '';
@@ -559,6 +779,7 @@ class J2CommerceFilters {
 
         // Sync product filter IDs
         const productfilterIds = Array.from(filterForm.querySelectorAll('[class*="j2commerce-pfilter-checkboxes"]:checked'))
+            .filter(pfilterValued)
             .map(cb => cb.value);
         productfilterIds.forEach(id => {
             const input = document.createElement('input');
@@ -622,7 +843,8 @@ class J2CommerceFilters {
 
             if (clearBtn) {
                 const checkboxClass = 'j2commerce-pfilter-checkboxes-' + filterScriptId;
-                const hasCheckedFilters = container.querySelectorAll('.' + checkboxClass + ':checked').length > 0;
+                const hasCheckedFilters = Array.from(container.querySelectorAll('.' + checkboxClass + ':checked'))
+                    .some(pfilterValued);
                 clearBtn.style.display = hasCheckedFilters ? '' : 'none';
 
                 // Expand the accordion/accordion panel if it has checked filters
@@ -672,7 +894,8 @@ class J2CommerceFilters {
         const tiles = [];
 
         const getCheckboxLabel = (cb) =>
-            cb.closest('.form-check')?.querySelector('.form-check-label')?.textContent?.trim()
+            cb.dataset.label?.trim()
+            ?? cb.closest('.form-check')?.querySelector('.form-check-label')?.textContent?.trim()
             ?? cb.labels?.[0]?.textContent?.trim()
             ?? cb.closest('label')?.textContent?.trim();
 
@@ -687,6 +910,8 @@ class J2CommerceFilters {
         });
 
         document.querySelectorAll('[class*="j2commerce-pfilter-checkboxes"]:checked').forEach(cb => {
+            if (!pfilterValued(cb)) return;
+
             const label = getCheckboxLabel(cb);
             if (label) tiles.push(this.createTileHtml('productfilter', cb.value, label));
         });
@@ -778,7 +1003,7 @@ class J2CommerceFilters {
         // reads every checkbox in the document, so the filter would survive its own removal.
         const uncheckByValue = (selector) =>
             document.querySelectorAll(selector).forEach(cb => {
-                if (cb.value === id) cb.checked = false;
+                if (cb.value === id) pfilterPick(cb, false);
             });
 
         switch (type) {
@@ -792,6 +1017,7 @@ class J2CommerceFilters {
             }
             case 'productfilter': {
                 uncheckByValue('[class*="j2commerce-pfilter-checkboxes"]');
+                this.syncAnyControls();
                 break;
             }
             case 'price': {

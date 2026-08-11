@@ -48,6 +48,28 @@ class ProductsController extends AdminProductsController
     ];
 
     /**
+     * Methods AdminController and the admin Products controller provide for managing the list
+     * itself. They act on the catalogue rather than on one shopper's request, no storefront
+     * surface calls any of them, and the administrator client reaches them through their own
+     * screen — so this class does not serve them at all.
+     *
+     * Matched against the method the task map resolves to, the way WriteAccessTrait matches,
+     * so the aliases core registers — unpublish, archive, trash, orderup, unfeatured — are
+     * covered without naming each one.
+     */
+    private const ADMIN_ONLY_METHODS = [
+        'batch',
+        'featured',
+        'delete',
+        'publish',
+        'reorder',
+        'saveorder',
+        'saveOrderAjax',
+        'checkin',
+        'runTransition',
+    ];
+
+    /**
      * The public tasks read; without this they would inherit the admin controller's list and
      * WriteAccessTrait would demand j2commerce.editproducts from every shopper.
      */
@@ -61,7 +83,20 @@ class ProductsController extends AdminProductsController
         // Lower-cased to match BaseController::execute(), which lower-cases the task
         // before resolving it against $taskMap. Comparing the raw string here would
         // let a differently-cased task skip this gate and still dispatch.
-        if (!\in_array(strtolower((string) $task), self::PUBLIC_SITE_TASKS, true) && !$this->authorizeVariantAjax()) {
+        $lower = strtolower((string) $task);
+
+        // The storefront calls none of the inherited list-management methods and the administrator
+        // reaches them through its own screen, so this client declines them outright rather than
+        // resolving a permission for them.
+        $resolved = $this->taskMap[$lower] ?? ($this->taskMap['__default'] ?? null);
+
+        if ($resolved !== null && \in_array($resolved, self::ADMIN_ONLY_METHODS, true)) {
+            $this->sendVariantJsonError(Text::_('JLIB_APPLICATION_ERROR_ACCESS_FORBIDDEN'));
+
+            return false;
+        }
+
+        if (!\in_array($lower, self::PUBLIC_SITE_TASKS, true) && !$this->authorizeVariantAjax()) {
             $this->sendVariantJsonError(Text::_('JLIB_APPLICATION_ERROR_ACCESS_FORBIDDEN'));
             return false;
         }
@@ -225,6 +260,9 @@ class ProductsController extends AdminProductsController
                 'total'      => $pagination->total,
                 'start'      => $pagination->limitstart,
                 'limit'      => $pagination->limit,
+                // Without this the sidebar keeps the counts of whatever the last full page
+                // render produced, which stop describing the listing on the first tick.
+                'filterCounts' => $this->filterCounts($model),
             ];
 
             $app->setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -287,6 +325,31 @@ class ProductsController extends AdminProductsController
         $app->getDocument()->setMimeEncoding('application/json');
         echo json_encode(['success' => false, 'message' => $message]);
         $app->close();
+    }
+
+    /**
+     * How many products each sidebar filter value still reaches, keyed by filter ID.
+     *
+     * The value list itself is a superset the full page render already emitted, so only the
+     * counts travel: the sidebar updates in place and keeps its accordion and focus state.
+     *
+     * @return array<int, int>
+     */
+    protected function filterCounts(ListModel $model): array
+    {
+        if (!method_exists($model, 'getProductFilterFacets')) {
+            return [];
+        }
+
+        $counts = [];
+
+        foreach ($model->getProductFilterFacets() as $group) {
+            foreach ($group['filters'] as $filter) {
+                $counts[(int) $filter->filter_id] = (int) $filter->product_count;
+            }
+        }
+
+        return $counts;
     }
 
     protected function renderProducts(array $items, Registry $params, int $catid): string

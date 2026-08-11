@@ -70,7 +70,7 @@ if ($showItemTax && isset($this->taxes) && \count($this->taxes)) {
                         <td>
                             <div class="d-flex align-items-start gap-2">
                                 <?php if ($showThumbCart && !empty($thumbImage)) : ?>
-                                    <img src="<?php echo $thumbImage; ?>"
+                                    <img src="<?php echo $this->escape($thumbImage); ?>"
                                          alt="<?php echo $this->escape($item->orderitem_name); ?>"
                                          class="rounded flex-shrink-0"
                                          width="50">
@@ -94,7 +94,7 @@ if ($showItemTax && isset($this->taxes) && \count($this->taxes)) {
 
                         <?php if ($showSku) : ?>
                             <td>
-                                <small class="text-muted"><?php echo $this->escape($item->orderitem_sku ?? ''); ?></small>
+                                <small class="text-body-secondary"><?php echo $this->escape($item->orderitem_sku ?? ''); ?></small>
                             </td>
                         <?php endif; ?>
 

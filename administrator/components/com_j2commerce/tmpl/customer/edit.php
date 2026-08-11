@@ -43,7 +43,7 @@ $this->getDocument()->addScriptOptions('com_j2commerce.customer_addresses', [
     'saveUrl'       => $baseUri . '/index.php?option=com_j2commerce&task=customer.ajaxSaveAddress&format=raw',
     'deleteUrl'     => $baseUri . '/index.php?option=com_j2commerce&task=customer.ajaxDeleteAddress&format=raw',
     'relinkUrl'     => $baseUri . '/index.php?option=com_j2commerce&task=customer.ajaxRelinkUser&format=raw',
-    'zonesUrl'      => $baseUri . '/index.php?option=com_j2commerce&task=manufacturer.getZones',
+    'zonesUrl'      => $baseUri . '/index.php?option=com_j2commerce&task=ajax.getZones&response=json',
     'userId'        => $targetUser,
     'currentId'     => $currentId,
     'cardMode'      => $this->useCardMode,
@@ -141,7 +141,7 @@ $coreFields = [
                         <div class="form-grid">
                             <?php echo $this->form->renderField('user_id'); ?>
                         </div>
-                        <p class="form-text small text-muted mt-2">
+                        <p class="form-text small text-body-secondary mt-2">
                             <?php echo Text::_('COM_J2COMMERCE_CUSTOMER_USER_RELINK_NOTE'); ?>
                         </p>
                     </fieldset>

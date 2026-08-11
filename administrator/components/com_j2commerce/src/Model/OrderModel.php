@@ -21,8 +21,10 @@ use J2Commerce\Component\J2commerce\Administrator\Helper\EmailHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\ImageHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\InventoryHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\J2CommerceHelper;
+use J2Commerce\Component\J2commerce\Administrator\Helper\OrderHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\OrderHistoryHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\OrderItemAttributeHelper;
+use J2Commerce\Component\J2commerce\Administrator\Helper\OrderUploadHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\ProductHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\TaxHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\UserHelper;
@@ -1079,6 +1081,13 @@ class OrderModel extends AdminModel
             return true;
         }
 
+        // Reclaim any customer uploads a later, abandoned order for the same cart took —
+        // see the matching call in OrderTable::store(). Runs on the winner of the
+        // compare-and-swap above, before the status event, so listeners see them.
+        if ($oldStatusId === 5 && InventoryHelper::statusHoldsStock($newStatusId)) {
+            OrderUploadHelper::attachUploadsToOrder($orderId, (string) $order->order_id);
+        }
+
         // Inventory. This model writes order_state_id directly rather than through
         // OrderTable::store(), so without this call every status change made here —
         // the admin dropdown, the bulk action, the hold_stock sweep and the shipping
@@ -1861,7 +1870,11 @@ class OrderModel extends AdminModel
         // Let extensions substitute per-line values (e.g. a per-variant tax profile) before the row is
         // persisted — the admin counterpart to the storefront onJ2CommerceGetDiscountedPrice seam.
         // $row is passed by reference; $variant carries the variant_id needed to resolve a per-variant value.
+        $baseline = (array) $row;
+
         J2CommerceHelper::plugin()->event('BeforeAddOrderItem', [&$row, $variant]);
+
+        OrderHelper::normalizeOrderItemRow($row, $baseline);
 
         $db->insertObject('#__j2commerce_orderitems', $row, 'j2commerce_orderitem_id');
 

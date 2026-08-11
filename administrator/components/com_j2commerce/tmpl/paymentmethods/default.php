@@ -10,6 +10,7 @@
 defined('_JEXEC') or die;
 
 use J2Commerce\Component\J2commerce\Administrator\Helper\J2CommerceHelper;
+use J2Commerce\Component\J2commerce\Administrator\Helper\J2htmlHelper;
 use Joomla\CMS\Button\PublishedButton;
 use Joomla\CMS\Factory;
 use Joomla\CMS\HTML\HTMLHelper;
@@ -175,7 +176,7 @@ $encodedReturn = base64_encode('index.php?option=com_j2commerce&view=paymentmeth
                                             <?php else : ?>
                                                 <span class="d-none d-lg-inline-block d-md-block">
                                             <?php endif; ?>
-                                                <img src="<?php echo $imagePath; ?>" class="img-fluid j2commerce-payment-image" alt="<?php echo Text::_($item->name); ?>"/>
+                                                <img src="<?php echo $this->escape($imagePath); ?>" class="img-fluid j2commerce-payment-image" alt="<?php echo $this->escape(Text::_($item->name)); ?>"/>
                                             <?php if ($canEdit) : ?>
                                                 </a>
                                             <?php else : ?>
@@ -184,6 +185,9 @@ $encodedReturn = base64_encode('index.php?option=com_j2commerce&view=paymentmeth
                                         </div>
                                         <div class="flex-grow-1 ms-lg-3 mt-0 mt-lg-0">
                                             <div>
+                                                <?php if (!empty($item->checked_out)) : ?>
+                                                    <?php echo J2htmlHelper::checkedOut($i, $item->editor, $item->checked_out_time, 'paymentmethods.', $canCheckin); ?>
+                                                <?php endif; ?>
                                                 <?php if ($canEdit) : ?>
                                                     <a href="<?php echo $link; ?>">
                                                         <?php echo Text::_($item->name); ?>

@@ -1607,15 +1607,7 @@ class CheckoutController extends BaseController
             return;
         } // end isOwningRequest() block
 
-        if ($session->has('payment_values', 'j2commerce')) {
-            $paymentValues = $session->get('payment_values', [], 'j2commerce');
-
-            foreach ($paymentValues as $name => $value) {
-                if (\is_string($value)) {
-                    $this->input->set($name, $value);
-                }
-            }
-        }
+        $this->replayPaymentValues();
 
         try {
             $order = $this->getCartOrder();
@@ -1624,9 +1616,14 @@ class CheckoutController extends BaseController
             // before confirm — re-check here so two shoppers cannot both buy the last
             // unit. (The former guard called a validateOrder() that exists nowhere.)
             if ($order && !$order->validate_order_stock()) {
-                foreach ($order->getStockErrors() as $stockError) {
-                    $errors[] = $stockError;
-                }
+                // The boolean is the verdict, the messages only explain it. A listener that
+                // re-keyed the line collection it was handed could leave the two disagreeing,
+                // and confirm is the last stock gate on this path — so a refusal blocks even
+                // when nothing came back to say why.
+                $errors = array_merge(
+                    $errors,
+                    $order->getStockErrors() ?: [Text::_('COM_J2COMMERCE_ERR_GENERIC')]
+                );
             }
         } catch (\Throwable $e) {
             Log::add('checkout.confirm order build failed: ' . $e->getMessage(), Log::ERROR, 'com_j2commerce');
@@ -1941,6 +1938,16 @@ class CheckoutController extends BaseController
             }
         }
 
+        // The cart order is rebuilt below (veto re-assert, and the re-check against the
+        // stored row), and a fee plugin that reads a step-4 field out of the request
+        // computes from whatever confirm() gave it. Without the same replay here the two
+        // builds disagree on every request, which the shopper meets as a checkout that
+        // never completes rather than a one-off bounce. An off-site gateway return has
+        // proven no shopper intent, and a context order was never built from a cart.
+        if (!$tokenlessGatewayReturn && !$wasContextActivated) {
+            $this->replayPaymentValues();
+        }
+
         // Re-assert the app-plugin veto at submit time. confirm() dispatches AfterOrderValidate
         // when the review page is RENDERED; a shopper who loaded that page while the veto was
         // clear could otherwise submit after it applies and have the order taken anyway — the
@@ -2012,6 +2019,57 @@ class CheckoutController extends BaseController
 
         if ($orderTable) {
             $orderTable->load(['order_id' => $orderId]);
+        }
+
+        // The confirm step persists an order and then keeps rendering while the cart
+        // underneath it can still change — the coupon and voucher forms live in the
+        // sidecart, which is on screen throughout. The step re-persists when those
+        // change, but a template override, a second tab or any future cart-touching
+        // path need not go through it, so the amount about to be charged is checked
+        // against the cart one last time here.
+        //
+        // Deliberately narrow. It runs only where the order is still this session's
+        // unfinished cart purchase: an off-site gateway return has already taken the
+        // money, a context order was never built from a cart, and a cart that has been
+        // emptied (order_placed timing, or a retry after one) has nothing to compare.
+        // The surcharge is resolved from the payment method the stored row was saved
+        // with, since that is the method that produced the stored total.
+        if (!$tokenlessGatewayReturn
+            && !$wasContextActivated
+            && !empty($orderId)
+            && !empty($orderTable->j2commerce_order_id)
+            && (int) ($orderTable->order_state_id ?? 0) === 5
+        ) {
+            try {
+                $currentOrder = $this->getCartOrder();
+
+                if ($currentOrder instanceof CartOrder && $currentOrder->getItems()) {
+                    $currentOrder->orderpayment_type = (string) ($orderTable->orderpayment_type ?? '');
+                    $currentOrder->applyPaymentSurcharge();
+
+                    if (!$this->orderMatchesCart($orderTable, $currentOrder)) {
+                        $message = Text::_('COM_J2COMMERCE_CHECKOUT_ERROR_ORDER_OUT_OF_DATE');
+                        $paction = $this->input->getString('paction', '');
+                        $isAjax  = $paction === 'process'
+                            || strtolower($this->input->server->getString('HTTP_X_REQUESTED_WITH', '')) === 'xmlhttprequest';
+
+                        if ($isAjax) {
+                            $this->jsonResponse(['success' => false, 'error' => $message]);
+
+                            return;
+                        }
+
+                        $this->app->enqueueMessage($message, 'warning');
+                        $this->app->redirect($this->getCheckoutUrl());
+
+                        return;
+                    }
+                }
+            } catch (\Throwable $e) {
+                // The comparison could not be made. Refusing on that would strand a
+                // shopper whose order is fine, so the earlier gates stand alone here.
+                Log::add('checkout.confirmPayment cart re-check failed: ' . $e->getMessage(), Log::ERROR, 'com_j2commerce');
+            }
         }
 
         $showPayment = false;
@@ -2673,6 +2731,28 @@ class CheckoutController extends BaseController
     // =========================================================================
     // Helpers
     // =========================================================================
+
+    /**
+     * Replay the step-4 payment selection out of the session into the request, so a
+     * plugin that reads those fields sees them on the later steps that no longer post
+     * them. Only keys the request does not already carry are injected: the stored copy
+     * is one pass behind, and shadowing a value the shopper just submitted would charge
+     * the gateway they deselected.
+     */
+    private function replayPaymentValues(): void
+    {
+        $session = $this->app->getSession();
+
+        if (!$session->has('payment_values', 'j2commerce')) {
+            return;
+        }
+
+        foreach ($session->get('payment_values', [], 'j2commerce') as $name => $value) {
+            if (\is_string($value) && $this->input->get($name, null, 'raw') === null) {
+                $this->input->set($name, $value);
+            }
+        }
+    }
 
     protected function getCartOrder(): ?object
     {

@@ -18,6 +18,7 @@ use J2Commerce\Component\J2commerce\Administrator\Helper\J2CommerceHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\ProductHelper;
 use J2Commerce\Component\J2commerce\Administrator\Service\ProductService;
 use J2Commerce\Component\J2commerce\Site\Helper\ProductVisibilityHelper;
+use J2Commerce\Component\J2commerce\Site\Helper\RouteHelper;
 use J2Commerce\Component\J2commerce\Site\Service\ProductLayoutService;
 use Joomla\CMS\Cache\CacheControllerFactoryInterface;
 use Joomla\CMS\Component\ComponentHelper;
@@ -33,6 +34,7 @@ use Joomla\CMS\Form\Form;
 use Joomla\CMS\Language\Text;
 use Joomla\CMS\Log\Log;
 use Joomla\CMS\Plugin\CMSPlugin;
+use Joomla\CMS\Plugin\PluginHelper;
 use Joomla\CMS\Router\Route;
 use Joomla\Database\DatabaseAwareTrait;
 use Joomla\Database\ParameterType;
@@ -95,6 +97,15 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
 
     private static array $articleCache = [];
 
+    /**
+     * Recursion guard for the prepare_content event dispatch.
+     * Set to true while we are inside our own secondary onContentPrepare dispatch
+     * so that J2Commerce's handler skips all processing for that inner call.
+     *
+     * @since  6.5.2
+     */
+    private static bool $preparingContent = false;
+
     /** Per-productId counter so shortcode-rendered cart forms get unique ids when a product appears more than once on a page. */
     private static array $cartFormInstanceCounts = [];
 
@@ -135,6 +146,12 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
         $article = $event->getItem();
         $params  = $event->getParams();
 
+        // Guard against the recursive onContentPrepare event dispatched by our own
+        // prepare_content logic at the end of this method.
+        if (self::$preparingContent) {
+            return;
+        }
+
         // Strip shortcodes when Smart Search indexer is running
         if ($context === 'com_finder.indexer' && (bool) $this->params->get('shortcode_strip_in_finder', 1)) {
             if (isset($article->text)) {
@@ -155,37 +172,122 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
             return;
         }
 
-        // Handle product list context - strip shortcodes
-        if (strpos($context, 'productlist') !== false) {
-            $this->stripShortcodes($article);
+        // Called from ProductHelper::prepareProductDescriptions() to run content
+        // plugins on product_short_desc / product_long_desc.  Skip all J2Commerce
+        // rendering (product blocks, shortcodes, inner dispatch) so the descriptions
+        // only get field tags / module tags resolved, never a duplicate product block.
+        //
+        // Two complementary guards:
+        //   1. isPreparingDescriptions() — a definitive static flag in ProductHelper;
+        //      reliable regardless of how the event subject is stored/returned.
+        //   2. j2commerce_desc_context on the fakeArticle — belt-and-suspenders
+        //      fallback for any code path that reaches here without the flag set.
+        if (ProductHelper::isPreparingDescriptions() || !empty($article->j2commerce_desc_context)) {
+            if (!(bool) $this->params->get('prepare_content', 1)) {
+                $this->stripContentPluginTags($article);
+            }
+
             return;
         }
 
-        // Clear caches if enabled
-        if ($this->params->get('cache_control', 1) && !$this->cacheCleared) {
-            $this->clearContentCaches();
+        // When prepare_content is off, strip standard Joomla content-plugin tags
+        // (loadposition / loadmodule / loadmoduleid) while preserving any patterns
+        // listed in the preserve_tags parameter.
+        if (!(bool) $this->params->get('prepare_content', 1)) {
+            $this->stripContentPluginTags($article);
         }
 
-        // Get J2Commerce component params for placement setting
-        $j2params   = ComponentHelper::getParams('com_j2commerce');
-        $placement  = $j2params->get('addtocart_placement', 'default');
+        if (strpos($context, 'productlist') !== false) {
+            // Product list: strip J2Commerce shortcodes from article descriptions,
+            // then fall through to the prepare_content dispatch below so that
+            // content-plugin tags in introtext / fulltext are rendered or stripped.
+            $this->stripShortcodes($article);
+        } else {
+            // Clear caches if enabled
+            if ($this->params->get('cache_control', 1) && !$this->cacheCleared) {
+                $this->clearContentCaches();
+            }
 
-        // Handle default position placement
-        if (strpos($context, 'com_content') !== false) {
-            if (\in_array($placement, ['default', 'both'], true)) {
-                if ($this->checkPublishDate($article)) {
-                    $this->renderDefaultPosition($context, $article, $params);
+            // Get J2Commerce component params for placement setting
+            $j2params  = ComponentHelper::getParams('com_j2commerce');
+            $placement = $j2params->get('addtocart_placement', 'default');
+
+            // Handle default position placement
+            if (strpos($context, 'com_content') !== false) {
+                if (\in_array($placement, ['default', 'both'], true)) {
+                    if ($this->checkPublishDate($article)) {
+                        $this->renderDefaultPosition($context, $article, $params);
+                    }
                 }
             }
+
+            // Handle tag-based placement
+            if (\in_array($placement, ['tag', 'both'], true)) {
+                $this->processWithinArticle($article);
+            }
+
+            // Always process J2Commerce shortcodes
+            $this->processShortcodes($context, $article, $params);
         }
 
-        // Handle tag-based placement
-        if (\in_array($placement, ['tag', 'both'], true)) {
-            $this->processWithinArticle($article);
-        }
+        // Re-dispatch onContentPrepare with the real article so content plugins can
+        // render remaining tags ({field 4}, {loadmoduleid 120}, etc.).
+        //
+        // Fires for all contexts — including productlist — when:
+        //   - prepare_content is on  → render all plugin tags in the text, OR
+        //   - preserve_tags is set   → stripContentPluginTags already removed the
+        //     unwanted tags; we still need to render the ones that were preserved.
+        //
+        // Using the real article (not a fake stdClass) ensures context-sensitive
+        // plugins like plg_content_fields can resolve field values by article ID.
+        // The static flag above prevents recursion.
+        $hasPreserveTags = trim((string) $this->params->get('preserve_tags', '')) !== '';
 
-        // Always process shortcodes
-        $this->processShortcodes($context, $article, $params);
+        if ((bool) $this->params->get('prepare_content', 1) || $hasPreserveTags) {
+            self::$preparingContent = true;
+            PluginHelper::importPlugin('content');
+            $dispatcher = Factory::getContainer()->get(DispatcherInterface::class);
+
+            try {
+                // Dispatch for each text property that carries content so that
+                // tags in introtext and fulltext are rendered even in list views
+                // where those properties are accessed directly by templates.
+                foreach (['text', 'introtext', 'fulltext'] as $prop) {
+                    if (!isset($article->$prop) || $article->$prop === '') {
+                        continue;
+                    }
+
+                    // When the property is text, dispatch normally.
+                    // For introtext / fulltext: swap into text, dispatch, swap back
+                    // so that content plugins (which only read $article->text) process it.
+                    if ($prop !== 'text') {
+                        if (!isset($article->text) || $article->$prop === $article->text) {
+                            continue;
+                        }
+
+                        $savedText     = $article->text ?? '';
+                        $article->text = $article->$prop;
+                    }
+
+                    $dispatcher->dispatch(
+                        'onContentPrepare',
+                        new ContentPrepareEvent('onContentPrepare', [
+                            'context' => $context,
+                            'subject' => $article,
+                            'params'  => $params,
+                            'page'    => 0,
+                        ])
+                    );
+
+                    if ($prop !== 'text') {
+                        $article->$prop = $article->text;
+                        $article->text  = $savedText;
+                    }
+                }
+            } finally {
+                self::$preparingContent = false;
+            }
+        }
     }
 
     /** @since 6.0.0 */
@@ -888,6 +990,69 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
     }
 
     /**
+     * Strip all Joomla content-plugin-style tags from article text when prepare_content
+     * is disabled. Handles both the paired form ({tagname}…{/tagname}) and the
+     * self-closing form ({tagname} / {tagname attributes}).
+     *
+     * J2Commerce's own {j2commerce} shortcodes are intentionally skipped here — they
+     * are processed or stripped elsewhere in the pipeline. Any tag whose raw text
+     * contains a fragment listed in the preserve_tags plugin parameter is also kept.
+     *
+     * @since   6.4.0
+     */
+    private function stripContentPluginTags(object $article): void
+    {
+        // Build the preserve list from the plugin parameter.
+        $preserveRaw  = trim((string) $this->params->get('preserve_tags', ''));
+        $preserveList = $preserveRaw !== ''
+            ? array_filter(array_map('trim', explode(',', $preserveRaw)))
+            : [];
+
+        // Returns true when the matched tag should be stripped.
+        $shouldStrip = static function (string $raw, string $tagName) use ($preserveList): bool {
+            if (strtolower($tagName) === 'j2commerce') {
+                return false;
+            }
+
+            foreach ($preserveList as $fragment) {
+                if ($fragment !== '' && stripos($raw, $fragment) !== false) {
+                    return false;
+                }
+            }
+
+            return true;
+        };
+
+        $strip = static function (string $text) use ($shouldStrip): string {
+            // Paired form first: {tagname …}…{/tagname}
+            $text = preg_replace_callback(
+                '/\{([a-z][a-z0-9_-]*)(?:\s[^{}]*)?\}.*?\{\/\1\}/is',
+                static function (array $m) use ($shouldStrip): string {
+                    return $shouldStrip($m[0], $m[1]) ? '' : $m[0];
+                },
+                $text
+            ) ?? $text;
+
+            // Self-closing form: {tagname} or {tagname attributes}
+            return preg_replace_callback(
+                '/\{([a-z][a-z0-9_-]*)(?:\s[^{}]*)?\}/i',
+                static function (array $m) use ($shouldStrip): string {
+                    return $shouldStrip($m[0], $m[1]) ? '' : $m[0];
+                },
+                $text
+            ) ?? $text;
+        };
+
+        // Process all three text properties so that tags are stripped regardless
+        // of which property is rendered by the active view template.
+        foreach (['text', 'introtext', 'fulltext'] as $prop) {
+            if (isset($article->$prop) && $article->$prop !== '') {
+                $article->$prop = $strip($article->$prop);
+            }
+        }
+    }
+
+    /**
      * @since   6.0.0
      */
     private function renderDefaultPosition(string $context, object $article, object $params): void
@@ -900,6 +1065,13 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
         }
 
         if (!isset($article->id) || !$article->id || $position === 'afterdisplaycontent') {
+            return;
+        }
+
+        // Never inject a product block while ProductHelper is preparing product
+        // descriptions — this is the definitive last-resort guard that prevents
+        // a duplicate product from appearing inside its own short/long description.
+        if (ProductHelper::isPreparingDescriptions() || !empty($article->j2commerce_desc_context)) {
             return;
         }
 
@@ -981,12 +1153,20 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
             );
         }
 
-        $categoryOptions = $this->params->get('category_product_options', 1);
-        $showOptions     = !(\in_array($context, ['com_content.category', 'com_content.featured'], true)
-            && \in_array($categoryOptions, [2, 3], true));
-
         $allOptions  = ['full', 'price', 'cart', 'options', 'sku', 'stock'];
         $displayData = $this->buildDisplayData($product, 'full', $allOptions);
+
+        // The list layouts already implement the three add-to-cart modes, keyed on the
+        // component's list_show_cart, so map this plugin's own setting onto that key.
+        // List surfaces only — the setting lives in the categoryview fieldset and must
+        // not reach a single article. buildArticleParams() hands back a fresh clone per
+        // call, so shortcodes elsewhere keep the component default.
+        if (\in_array($context, ['com_content.category', 'com_content.featured'], true)) {
+            $displayData['params']->set(
+                'list_show_cart',
+                (int) $this->params->get('category_product_options', 1)
+            );
+        }
 
         $displayData['showCart']    = true;
         $displayData['showPrice']   = true;
@@ -997,7 +1177,6 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
         // products is populated from exactly that text, rendering it here would cause
         // it to appear as a duplicate (double introtext).
         $displayData['showDescription'] = false;
-        $displayData['showOptions']     = $showOptions;
 
         return ProductLayoutService::renderLayout('list.category.item', $displayData);
     }
@@ -1007,31 +1186,62 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
     {
         $html = '';
 
-        // Determine settings based on context
+        // Determine settings based on context. Only list surfaces (category/featured)
+        // link the image to the product — on a single-article view the image belongs
+        // to the article's own product, so a link would point at the current page.
         if (\in_array($context, ['com_content.category', 'com_content.featured'], true)) {
-            $showImage     = $this->params->get('category_display_j2commerce_images', 1);
-            $imageType     = $this->params->get('category_image_type', 'thumbnail');
-            $imageLocation = 'default';
-            $mainWidth     = $this->params->get('list_image_thumbnail_width', 120);
+            $showImage       = $this->params->get('category_display_j2commerce_images', 1);
+            $imageType       = $this->params->get('category_image_type', 'thumbnail');
+            $imageLocation   = 'default';
+            $mainWidth       = (int) $this->params->get('list_image_thumbnail_width', 120);
+            $additionalWidth = (int) $this->params->get('list_product_additional_image_width', 80);
+            $enableZoom      = (int) $this->params->get('category_enable_image_zoom', 1) === 1;
+            $linkImage       = (int) $this->params->get('category_link_image_to_product', 1) === 1;
         } else {
-            $showImage     = $this->params->get('item_display_j2commerce_images', 1);
-            $imageType     = $this->params->get('item_image_type', 'main');
-            $imageLocation = $this->params->get('item_image_placement', 'default');
-            $mainWidth     = $this->params->get('item_product_main_image_width', 300);
+            $showImage       = $this->params->get('item_display_j2commerce_images', 1);
+            $imageType       = $this->params->get('item_image_type', 'main');
+            $imageLocation   = $this->params->get('item_image_placement', 'default');
+            $mainWidth       = (int) $this->params->get('item_product_main_image_width', 300);
+            $additionalWidth = (int) $this->params->get('item_product_additional_image_width', 100);
+            $enableZoom      = (int) $this->params->get('item_enable_image_zoom', 1) === 1;
+            $linkImage       = false;
         }
 
         if (!$showImage || $imageLocation !== 'default') {
             return $html;
         }
 
+        // A linked image navigates on click, and the zoom handler cancels that default,
+        // so the two cannot both own the click. The link wins.
+        $enableZoom = $enableZoom && !$linkImage;
+
         $images = $this->getProductImagesData($product->j2commerce_product_id, $imageType);
         // example: array(1) { [0]=> object(stdClass)#1894 (2) { ["image_path"]=> string(0) "" ["thumb_image"]=> string(0) "" } }
 
         if (!empty($images)) {
+            $productLink = '';
+
+            if ($linkImage) {
+                // xhtml=false: escape() below handles attribute encoding.
+                $productLink = $product->product_link ?? Route::_(RouteHelper::getProductRoute(
+                    (int) $product->j2commerce_product_id,
+                    $product->alias ?? null,
+                    (int) ($product->catid ?? 0) ?: null
+                ), false);
+            }
+
             $html .= '<div class="j2commerce-product-images">';
-            foreach ($images as $image) {
+            foreach ($images as $index => $image) {
                 if (!empty($image->image_path)) {
-                    $html .= '<img src="' . $this->escape($image->image_path) . '" alt="" class="j2commerce-product-image" style="max-width: ' . (int) $mainWidth . 'px;">';
+                    $img = $this->renderProductImageTag(
+                        $image->image_path,
+                        $index === 0 ? $mainWidth : $additionalWidth,
+                        $enableZoom
+                    );
+
+                    $html .= $productLink !== ''
+                        ? '<a href="' . $this->escape($productLink) . '">' . $img . '</a>'
+                        : $img;
                 }
             }
             $html .= '</div>';
@@ -1067,19 +1277,59 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
             return '';
         }
 
-        $imageType = $this->params->get('item_image_type', 'main');
-        $images    = $this->getProductImagesData($product->j2commerce_product_id, $imageType);
-        $html      = '';
+        $imageType       = $this->params->get('item_image_type', 'main');
+        $mainWidth       = (int) $this->params->get('item_product_main_image_width', 300);
+        $additionalWidth = (int) $this->params->get('item_product_additional_image_width', 100);
+        $enableZoom      = (int) $this->params->get('item_enable_image_zoom', 1) === 1;
+        $images          = $this->getProductImagesData($product->j2commerce_product_id, $imageType);
+        $html            = '';
 
         if (!empty($images)) {
             $html .= '<div class="j2commerce-product-images">';
-            foreach ($images as $image) {
-                $html .= '<img src="' . $this->escape($image->image_path) . '" alt="" class="j2commerce-product-image">';
+            foreach ($images as $index => $image) {
+                $html .= $this->renderProductImageTag(
+                    $image->image_path,
+                    $index === 0 ? $mainWidth : $additionalWidth,
+                    $enableZoom
+                );
             }
             $html .= '</div>';
         }
 
         return $html;
+    }
+
+    /**
+     * The first image is the main one; every image after it is an additional image
+     * and takes the narrower additional width.
+     *
+     * @since   6.5.1
+     */
+    private function renderProductImageTag(string $imagePath, int $width, bool $enableZoom): string
+    {
+        if ($enableZoom) {
+            $this->registerZoomAssets();
+        }
+
+        return '<img src="' . $this->escape($imagePath) . '" alt="" class="j2commerce-product-image"'
+            . ' style="max-width: ' . $width . 'px;"'
+            . ($enableZoom ? ' data-action="zoom"' : '') . '>';
+    }
+
+    /** Guarded — a category listing renders this once per product image. */
+    private function registerZoomAssets(): void
+    {
+        static $registered = false;
+
+        if ($registered) {
+            return;
+        }
+
+        $registered = true;
+
+        $wa = Factory::getApplication()->getDocument()->getWebAssetManager();
+        $wa->registerAndUseStyle('com_j2commerce.vendor.zoom.css', 'media/com_j2commerce/vendor/zoom-vanilla/css/zoom.css');
+        $wa->registerAndUseScript('com_j2commerce.vendor.zoom', 'media/com_j2commerce/vendor/zoom-vanilla/js/zoom-vanilla.min.js', [], ['defer' => true]);
     }
 
     /** @since 6.0.0 */
@@ -1204,7 +1454,14 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
                 }
 
                 $displayData = $this->buildDisplayData($product, $option, $options);
-                $rendered    = ProductLayoutService::renderLayout($layoutId, $displayData);
+
+                // Shortcode surfaces only — buildDisplayData() also serves the article
+                // product block, which follows the component's own settings. 'cartonly'
+                // routes to the bare cart partial and carries no option block either way.
+                $displayData['showOptions'] = $option !== 'cartonly'
+                    && (int) $this->params->get('shortcode_show_cart_options', 1) === 1;
+
+                $rendered = ProductLayoutService::renderLayout($layoutId, $displayData);
 
                 // 'cart'/'cartonly' render the bare cart-button partial, which has no
                 // <form> of its own (unlike 'full'/'card', which route through the full
@@ -1381,7 +1638,7 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
             // view_*.php files and sets the 'html' argument. We don't use
             // J2CommerceHelper::plugin()->eventWithHtml() because it overwrites
             // the 'html' argument with the concat of 'result' entries after dispatch.
-            \Joomla\CMS\Plugin\PluginHelper::importPlugin('j2commerce');
+            PluginHelper::importPlugin('j2commerce');
             $dispatcher  = Factory::getContainer()->get(DispatcherInterface::class);
             $pluginEvent = new \J2Commerce\Component\J2commerce\Administrator\Event\PluginEvent(
                 'onJ2CommerceViewProductHtml',
@@ -1428,7 +1685,7 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
             'shortcodeOption' => $option,
             'priceMode'       => $this->resolvePriceMode($option),
             'imageMode'       => $this->resolveImageMode($option),
-            'showOptions'     => $option !== 'cartonly',
+            'showOptions'     => true,
             'sourceContext'   => 'article',
         ];
     }

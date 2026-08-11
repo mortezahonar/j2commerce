@@ -134,7 +134,11 @@ document.addEventListener("DOMContentLoaded", function() {
             const token = Joomla.getOptions("csrf.token") || document.querySelector("input[type=hidden][name][value=\"1\"]")?.name || "";
 
             previewBtn.disabled = true;
-            previewBtn.innerHTML = "<span class=\"spinner-border spinner-border-sm\" aria-hidden=\"true\"></span> " + Joomla.Text._("COM_J2COMMERCE_EMAILTEMPLATE_LOADING");
+            const previewSpinner = document.createElement("span");
+            previewSpinner.className = "spinner-border spinner-border-sm";
+            previewSpinner.setAttribute("aria-hidden", "true");
+            previewBtn.replaceChildren(previewSpinner);
+            previewBtn.append(" " + Joomla.Text._("COM_J2COMMERCE_EMAILTEMPLATE_LOADING"));
 
             try {
                 const formData = new FormData();
@@ -163,7 +167,10 @@ document.addEventListener("DOMContentLoaded", function() {
             }
 
             previewBtn.disabled = false;
-            previewBtn.innerHTML = "<span class=\"icon-loop\"></span> ' . Text::_('COM_J2COMMERCE_EMAILTEMPLATE_REFRESH_PREVIEW', true) . '";
+            const previewIcon = document.createElement("span");
+            previewIcon.className = "icon-loop";
+            previewBtn.replaceChildren(previewIcon);
+            previewBtn.append(" ' . Text::_('COM_J2COMMERCE_EMAILTEMPLATE_REFRESH_PREVIEW', true) . '");
         });
     }
 
@@ -183,7 +190,11 @@ document.addEventListener("DOMContentLoaded", function() {
             const token = Joomla.getOptions("csrf.token") || document.querySelector("input[type=hidden][name][value=\"1\"]")?.name || "";
 
             confirmSendBtn.disabled = true;
-            confirmSendBtn.innerHTML = "<span class=\"spinner-border spinner-border-sm\" aria-hidden=\"true\"></span> " + Joomla.Text._("COM_J2COMMERCE_EMAILTEMPLATE_SENDING");
+            const sendSpinner = document.createElement("span");
+            sendSpinner.className = "spinner-border spinner-border-sm";
+            sendSpinner.setAttribute("aria-hidden", "true");
+            confirmSendBtn.replaceChildren(sendSpinner);
+            confirmSendBtn.append(" " + Joomla.Text._("COM_J2COMMERCE_EMAILTEMPLATE_SENDING"));
 
             try {
                 const formData = new FormData();
@@ -211,7 +222,10 @@ document.addEventListener("DOMContentLoaded", function() {
             }
 
             confirmSendBtn.disabled = false;
-            confirmSendBtn.innerHTML = "<span class=\"icon-envelope\"></span> ' . Text::_('COM_J2COMMERCE_EMAILTEMPLATE_SEND_TEST', true) . '";
+            const sendIcon = document.createElement("span");
+            sendIcon.className = "icon-envelope";
+            confirmSendBtn.replaceChildren(sendIcon);
+            confirmSendBtn.append(" ' . Text::_('COM_J2COMMERCE_EMAILTEMPLATE_SEND_TEST', true) . '");
         });
     }
 
@@ -470,7 +484,7 @@ $tmpl = $input->get('tmpl', '', 'cmd') === 'component' ? '&tmpl=component' : '';
         <div class="row">
             <div class="col-12">
                 <div class="d-flex justify-content-between align-items-center mb-3">
-                    <p class="text-muted mb-0"><?php echo Text::_('COM_J2COMMERCE_EMAILTEMPLATE_PREVIEW_DESC'); ?></p>
+                    <p class="text-body-secondary mb-0"><?php echo Text::_('COM_J2COMMERCE_EMAILTEMPLATE_PREVIEW_DESC'); ?></p>
                     <div>
                         <button type="button" class="btn btn-outline-primary btn-sm" id="btn-refresh-preview">
                             <span class="icon-loop" aria-hidden="true"></span>
@@ -526,7 +540,7 @@ $tmpl = $input->get('tmpl', '', 'cmd') === 'component' ? '&tmpl=component' : '';
                     <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="<?php echo Text::_('JCLOSE'); ?>"></button>
                 </div>
                 <div class="modal-body p-3">
-                    <p class="text-muted"><?php echo Text::_('COM_J2COMMERCE_EMAILTEMPLATE_LOAD_TEMPLATE_DESC'); ?></p>
+                    <p class="text-body-secondary"><?php echo Text::_('COM_J2COMMERCE_EMAILTEMPLATE_LOAD_TEMPLATE_DESC'); ?></p>
                     <div class="row" id="template-grid">
                         <?php
                         $templateBase = JPATH_ADMINISTRATOR . '/components/com_j2commerce/layouts/templates/email';
@@ -563,7 +577,7 @@ $tmpl = $input->get('tmpl', '', 'cmd') === 'component' ? '&tmpl=component' : '';
                                 <div class="card-body text-center p-3">
                                     <span class="icon-envelope d-block mb-2" style="font-size: 2rem; color: var(--gjs-text-muted, #6c757d);" aria-hidden="true"></span>
                                     <h3 class="card-title mb-1 fs-6"><?php echo $this->escape(ucfirst($design)); ?></h3>
-                                    <small class="text-muted"><?php echo $this->escape(ucfirst($dir)); ?></small>
+                                    <small class="text-body-secondary"><?php echo $this->escape(ucfirst($dir)); ?></small>
                                 </div>
                             </div>
                         </div>
@@ -577,7 +591,7 @@ $tmpl = $input->get('tmpl', '', 'cmd') === 'component' ? '&tmpl=component' : '';
                                 <div class="card-body text-center p-3">
                                     <span class="icon-envelope d-block mb-2" style="font-size: 2rem; color: var(--gjs-text-muted, #6c757d);" aria-hidden="true"></span>
                                     <h3 class="card-title mb-1 fs-6"><?php echo $this->escape($card['label'] ?? ''); ?></h3>
-                                    <small class="text-muted"><?php echo $this->escape($card['category'] ?? ''); ?></small>
+                                    <small class="text-body-secondary"><?php echo $this->escape($card['category'] ?? ''); ?></small>
                                 </div>
                             </div>
                         </div>

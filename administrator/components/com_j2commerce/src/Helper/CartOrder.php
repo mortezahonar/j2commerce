@@ -386,17 +386,26 @@ class CartOrder
     }
 
     /**
-     * Re-check stock for every managed line at order-build time.
+     * Re-check stock and the per-customer sale limits for every managed line at order-build time.
      *
-     * Add-to-cart and quantity-update enforce the stock rules, but time passes before
-     * confirm, so without this two shoppers can both buy the last unit. Quantities are
-     * summed per variant first: two lines of the same variant with different options
-     * must not each be measured against the full stock. Authority is
-     * `ProductHelper::checkStockStatus()` — the same helper the cart behaviors use, so
-     * backorder-enabled variants stay purchasable. A load or query failure is logged and the line
-     * skipped — deliberate, so an infrastructure error cannot block every shopper at checkout.
+     * Add-to-cart and quantity-update enforce both rules, but time passes before confirm,
+     * so without this two shoppers can both buy the last unit, and any path that reaches
+     * confirm without going back through a `Cart*` behavior leaves the limits unasserted.
+     * Quantities are summed per variant first: two lines of the same variant with different
+     * options must not each be measured against the full stock, and together they are what
+     * this shopper is asking to buy. Authority is `ProductHelper::checkStockStatus()` and
+     * `ProductHelper::validateQuantityRestriction()` — the same helpers the cart behaviors
+     * use, so backorder-enabled variants stay purchasable. A load or query failure is logged
+     * and the line skipped — deliberate, so an infrastructure error cannot block every
+     * shopper at checkout.
      *
-     * @return  bool  True when every managed line still has enough stock.
+     * A line whose stock is carried elsewhere — a composite parent whose components hold it —
+     * reports available on its own variant and passes the checks above unexamined, so
+     * `ValidateOrderStock` is dispatched for every line and a listener that owns one writes
+     * its own message onto `$item->stock_error`, which `getStockErrors()` then reports
+     * alongside core's findings.
+     *
+     * @return  bool  True when every managed line still has enough stock and is within its limits.
      *
      * @since   6.0.6
      */
@@ -416,7 +425,8 @@ class CartOrder
             }
         }
 
-        $short = [];
+        $short   = [];
+        $limited = [];
 
         foreach ($wanted as $variantId => $quantity) {
             try {
@@ -437,6 +447,13 @@ class CartOrder
 
                 if (!ProductHelper::checkStockStatus($variant, $quantity)) {
                     $short[$variantId] = (int) $variant->quantity;
+                    continue;
+                }
+
+                $limitError = ProductHelper::validateQuantityRestriction($variant, (float) $quantity);
+
+                if ($limitError !== '') {
+                    $limited[$variantId] = $limitError;
                 }
             } catch (\Exception $e) {
                 Log::add(
@@ -447,7 +464,41 @@ class CartOrder
             }
         }
 
-        if ($short === []) {
+        $delegated = false;
+
+        foreach ($this->items as $item) {
+            try {
+                // Dispatched for every line, not only managed ones: the parent a listener
+                // speaks for deliberately leaves manage-stock off, so gating on that would
+                // hide exactly the lines this exists for. Caught for the same reason the
+                // checks above are: this runs on cart and checkout renders as well as at
+                // confirm, so a listener throwing on a transient fault must cost one line
+                // its check rather than take every shopper's cart down with it.
+                $event = J2CommerceHelper::plugin()->event('ValidateOrderStock', [$item, $this]);
+
+                // Listeners written against the legacy contract refuse by argument rather
+                // than by message. Honour that refusal, and give the line a message of its
+                // own so the verdict and what the shopper is told cannot come apart.
+                if ($event->getArgument('result') === false && empty($item->stock_error)) {
+                    $item->stock_error = Text::sprintf(
+                        'COM_J2COMMERCE_CART_ITEM_STOCK_NOT_AVAILABLE',
+                        $item->product_name ?? ''
+                    );
+                }
+            } catch (\Throwable $e) {
+                Log::add(
+                    'ValidateOrderStock listener failed for product ' . ($item->product_id ?? 0) . ': ' . $e->getMessage(),
+                    Log::WARNING,
+                    'com_j2commerce'
+                );
+            }
+
+            if (!empty($item->stock_error)) {
+                $delegated = true;
+            }
+        }
+
+        if ($short === [] && $limited === [] && !$delegated) {
             return true;
         }
 
@@ -460,6 +511,12 @@ class CartOrder
                     $item->product_name ?? '',
                     $short[$variantId]
                 );
+
+                continue;
+            }
+
+            if (isset($limited[$variantId])) {
+                $item->stock_error = $limited[$variantId];
             }
         }
 
@@ -1848,57 +1905,46 @@ class CartOrder
                 $attributes = $item->product_options;
             }
 
-            $columns = [
-                'order_id', 'orderitem_type', 'cart_id', 'cartitem_id',
-                'product_id', 'product_type', 'variant_id', 'vendor_id',
-                'orderitem_sku', 'orderitem_name', 'orderitem_attributes',
-                'orderitem_quantity', 'orderitem_taxprofile_id',
-                'orderitem_per_item_tax', 'orderitem_tax',
-                'orderitem_discount', 'orderitem_discount_tax',
-                'orderitem_price', 'orderitem_option_price',
-                'orderitem_finalprice', 'orderitem_finalprice_with_tax',
-                'orderitem_finalprice_without_tax', 'orderitem_params',
-                'created_on', 'created_by',
-                'orderitem_weight', 'orderitem_weight_total',
+            $row = (object) [
+                'order_id'                         => $orderId,
+                'orderitem_type'                   => 'normal',
+                'cart_id'                          => (int) ($this->cart_id),
+                'cartitem_id'                      => (int) ($item->j2commerce_cartitem_id ?? $item->cartitem_id ?? 0),
+                'product_id'                       => (int) ($item->product_id ?? 0),
+                'product_type'                     => $itemProductType,
+                'variant_id'                       => (int) ($item->variant_id ?? 0),
+                'vendor_id'                        => (int) ($item->vendor_id ?? 0),
+                'orderitem_sku'                    => (string) ($item->sku ?? ''),
+                'orderitem_name'                   => (string) ($item->product_name ?? $item->orderitem_name ?? ''),
+                'orderitem_attributes'             => (string) $attributes,
+                'orderitem_quantity'               => (string) $quantity,
+                'orderitem_taxprofile_id'          => (int) ($item->taxprofile_id ?? $pricing->taxprofile_id ?? 0),
+                'orderitem_per_item_tax'           => $perItemTax,
+                'orderitem_tax'                    => $itemTax,
+                'orderitem_discount'               => 0,
+                'orderitem_discount_tax'           => 0,
+                'orderitem_price'                  => $basePrice,
+                'orderitem_option_price'           => $optionPrice,
+                'orderitem_finalprice'             => $finalPrice,
+                'orderitem_finalprice_with_tax'    => $finalPriceWithTax,
+                'orderitem_finalprice_without_tax' => $finalPrice,
+                'orderitem_params'                 => (string) ($item->cartitem_params ?? $item->orderitem_params ?? '{}'),
+                'created_on'                       => $now,
+                'created_by'                       => $userId,
+                'orderitem_weight'                 => (string) ($item->weight ?? 0),
+                'orderitem_weight_total'           => (string) (($item->weight ?? 0) * $quantity),
             ];
 
-            $values = [
-                $db->quote($orderId),
-                $db->quote('normal'),
-                (int) ($this->cart_id),
-                (int) ($item->j2commerce_cartitem_id ?? $item->cartitem_id ?? 0),
-                (int) ($item->product_id ?? 0),
-                $db->quote($itemProductType),
-                (int) ($item->variant_id ?? 0),
-                (int) ($item->vendor_id ?? 0),
-                $db->quote($item->sku ?? ''),
-                $db->quote($item->product_name ?? $item->orderitem_name ?? ''),
-                $db->quote($attributes),
-                $db->quote((string) $quantity),
-                (int) ($item->taxprofile_id ?? $pricing->taxprofile_id ?? 0),
-                $perItemTax,
-                $itemTax,
-                0, // orderitem_discount
-                0, // orderitem_discount_tax
-                $basePrice,
-                $optionPrice,
-                $finalPrice,
-                $finalPriceWithTax,
-                $finalPrice, // without tax
-                $db->quote($item->cartitem_params ?? $item->orderitem_params ?? '{}'),
-                $db->quote($now),
-                $userId,
-                $db->quote((string) ($item->weight ?? 0)),
-                $db->quote((string) (($item->weight ?? 0) * $quantity)),
-            ];
+            // Storefront counterpart to the dispatch in OrderModel::addOrderItemFromVariant() — same event,
+            // same by-reference contract, so one handler serves both write paths. The cart item travels with
+            // the row because the shopper's selections live there, not on the order item being built.
+            $baseline = (array) $row;
 
-            $query = $db->getQuery(true)
-                ->insert($db->quoteName('#__j2commerce_orderitems'))
-                ->columns($db->quoteName($columns))
-                ->values(implode(',', $values));
+            J2CommerceHelper::plugin()->event('BeforeAddOrderItem', [&$row, $item]);
 
-            $db->setQuery($query);
-            $db->execute();
+            OrderHelper::normalizeOrderItemRow($row, $baseline);
+
+            $db->insertObject('#__j2commerce_orderitems', $row, 'j2commerce_orderitem_id');
         }
     }
 

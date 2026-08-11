@@ -10,6 +10,7 @@
 defined('_JEXEC') or die;
 
 use J2Commerce\Component\J2commerce\Administrator\Helper\J2CommerceHelper;
+use J2Commerce\Component\J2commerce\Administrator\Helper\J2htmlHelper;
 use Joomla\CMS\HTML\HTMLHelper;
 use Joomla\CMS\Language\Text;
 use Joomla\CMS\Layout\LayoutHelper;
@@ -169,7 +170,7 @@ HTMLHelper::_('bootstrap.tooltip', '[data-bs-toggle="tooltip"]', ['placement' =>
                                             <?php else : ?>
                                                 <span class="d-none d-lg-inline-block d-md-block">
                                             <?php endif; ?>
-                                                <img src="<?php echo $imagePath; ?>" class="img-fluid j2commerce-report-image" alt="<?php echo Text::_($item->name); ?>"/>
+                                                <img src="<?php echo $this->escape($imagePath); ?>" class="img-fluid j2commerce-report-image" alt="<?php echo $this->escape(Text::_($item->name)); ?>"/>
                                             <?php if ($canEdit) : ?>
                                                 </a>
                                             <?php else : ?>
@@ -178,6 +179,9 @@ HTMLHelper::_('bootstrap.tooltip', '[data-bs-toggle="tooltip"]', ['placement' =>
                                         </div>
                                         <div class="flex-grow-1 ms-lg-3 mt-0 mt-lg-0">
                                             <div>
+                                                <?php if (!empty($item->checked_out)) : ?>
+                                                    <?php echo J2htmlHelper::checkedOut($i, $item->editor, $item->checked_out_time, 'reports.', $canCheckin); ?>
+                                                <?php endif; ?>
                                                 <?php if ($canEdit) : ?>
                                                     <a href="<?php echo Route::_('index.php?option=com_plugins&task=plugin.edit&extension_id=' . $item->extension_id . '&return=' . $returnUrl); ?>">
                                                         <?php echo Text::_($item->name); ?>
@@ -206,7 +210,7 @@ HTMLHelper::_('bootstrap.tooltip', '[data-bs-toggle="tooltip"]', ['placement' =>
                                             <?php echo Text::_('COM_J2COMMERCE_REPORT_VIEW'); ?>
                                         </a>
                                     <?php else : ?>
-                                        <span class="text-muted">—</span>
+                                        <span class="text-body-secondary">—</span>
                                     <?php endif; ?>
                                 </td>
                                 <td class="d-none d-md-table-cell">

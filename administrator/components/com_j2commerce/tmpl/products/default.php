@@ -151,7 +151,7 @@ $canChangeState = $user->authorise('core.edit.state', 'com_content');
                                         <?php endif; ?>
                                         <div class="flex-grow-1">
                                             <?php if (!empty($item->checked_out)) : ?>
-                                                <?php echo HTMLHelper::_('jgrid.checkedout', $i, $item->editor, $item->checked_out_time, 'products.', $canCheckin); ?>
+                                                <?php echo J2htmlHelper::checkedOut($i, $item->editor, $item->checked_out_time, 'products.', $canCheckin); ?>
                                             <?php endif; ?>
                                             <a href="<?php echo $contentEditLink; ?>" class="fw-semibold">
                                                 <?php echo $this->escape($item->product_name ?: Text::_('COM_J2COMMERCE_NO_PRODUCT_NAME')); ?>
@@ -203,6 +203,10 @@ $canChangeState = $user->authorise('core.edit.state', 'com_content');
                 <input type="hidden" name="task" value="">
                 <input type="hidden" name="boxchecked" value="0">
                 <?php echo HTMLHelper::_('form.token'); ?>
+
+                <?php if ($this->canBatch) : ?>
+                    <template id="joomla-dialog-batch"><?php echo $this->loadTemplate('batch_body'); ?></template>
+                <?php endif; ?>
             </div>
         </div>
     </div>

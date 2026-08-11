@@ -126,7 +126,11 @@ document.addEventListener("DOMContentLoaded", function() {
             const token = Joomla.getOptions("csrf.token") || document.querySelector("input[type=hidden][name][value=\"1\"]")?.name || "";
 
             printBtn.disabled = true;
-            printBtn.innerHTML = "<div class=\"spinner-border text-light\" aria-hidden=\"true\"></div> " + Joomla.Text._("COM_J2COMMERCE_INVOICETEMPLATE_LOADING");
+            const printSpinner = document.createElement("div");
+            printSpinner.className = "spinner-border text-light";
+            printSpinner.setAttribute("aria-hidden", "true");
+            printBtn.replaceChildren(printSpinner);
+            printBtn.append(" " + Joomla.Text._("COM_J2COMMERCE_INVOICETEMPLATE_LOADING"));
 
             try {
                 const formData = new FormData();
@@ -167,7 +171,10 @@ document.addEventListener("DOMContentLoaded", function() {
             }
 
             printBtn.disabled = false;
-            printBtn.innerHTML = "<span class=\"icon-print\"></span> " + Joomla.Text._("COM_J2COMMERCE_INVOICETEMPLATE_PRINT_TEST");
+            const printIcon = document.createElement("span");
+            printIcon.className = "icon-print";
+            printBtn.replaceChildren(printIcon);
+            printBtn.append(" " + Joomla.Text._("COM_J2COMMERCE_INVOICETEMPLATE_PRINT_TEST"));
         });
     }
 
@@ -258,7 +265,7 @@ document.addEventListener("DOMContentLoaded", function() {
                             + \'<div class="card-body text-center p-3">\'
                             + \'<span class="icon-print d-block mb-2" style="font-size:2rem;color:var(--gjs-text-muted,#6c757d);" aria-hidden="true"></span>\'
                             + \'<h3 class="card-title mb-1 fs-6">\' + preset.label + \'</h3>\'
-                            + \'<small class="text-muted">\' + type.charAt(0).toUpperCase() + type.slice(1).replace("_", " ") + \'</small>\'
+                            + \'<small class="text-body-secondary">\' + type.charAt(0).toUpperCase() + type.slice(1).replace("_", " ") + \'</small>\'
                             + \'</div></div></div>\';
                     });
                     html += \'</div>\';
@@ -403,7 +410,7 @@ $tmpl   = $input->get('tmpl', '', 'cmd') === 'component' ? '&tmpl=component' : '
                     <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="<?php echo Text::_('JCLOSE'); ?>"></button>
                 </div>
                 <div class="modal-body p-3">
-                    <p class="text-muted"><?php echo Text::_('COM_J2COMMERCE_INVOICETEMPLATE_LOAD_TEMPLATE_DESC'); ?></p>
+                    <p class="text-body-secondary"><?php echo Text::_('COM_J2COMMERCE_INVOICETEMPLATE_LOAD_TEMPLATE_DESC'); ?></p>
                     <div id="template-grid">
                         <div class="text-center py-4">
                             <div class="spinner-border text-primary" role="status">
