@@ -16,6 +16,7 @@ use J2Commerce\Component\J2commerce\Administrator\CliCommands\SeedOrderLedgerCom
 use J2Commerce\Component\J2commerce\Administrator\Helper\AclSeedHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\AttachmentDenyFileHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\CoreTemplateSyncHelper;
+use J2Commerce\Component\J2commerce\Administrator\Helper\DownloadHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\InventoryHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\StockCommittedSeedHelper;
 use Joomla\CMS\Access\Access;
@@ -145,6 +146,8 @@ class Com_J2commerceInstallerScript extends InstallerScript
 
         $this->ensureFilesFolder();
 
+        $this->protectStoredDownloadFiles();
+
         Factory::getApplication()->enqueueMessage(Text::_('COM_J2COMMERCE_INSTALL_SUCCESS'), 'success');
 
         $this->debugLog("=== INSTALL END ===");
@@ -163,7 +166,11 @@ class Com_J2commerceInstallerScript extends InstallerScript
 
         $this->ensureFilesFolder();
 
+        $this->protectStoredDownloadFiles();
+
         $this->cleanupStaleCheckoutTemplates();
+
+        $this->removeObsoleteSchemaUpdates($parent);
 
         $this->seedOrderLedgerOnce();
 
@@ -188,6 +195,51 @@ class Com_J2commerceInstallerScript extends InstallerScript
             $path = $dir . $file;
             if (is_file($path) && @unlink($path)) {
                 $this->debugLog("UPDATE: removed stale checkout template {$file}");
+            }
+        }
+    }
+
+    /**
+     * Drop schema update files the installed package no longer ships. Joomla overwrites files on
+     * update but never deletes retired ones, and ChangeSet parses every .sql in the folder without
+     * consulting #__schemas — so a retired delta keeps being reported by Extensions -> Manage ->
+     * Database forever, and Fix re-executes its DDL every time it is clicked.
+     *
+     * MUST run after Installer::parseSchemaUpdates(), never in preflight: until that pass completes,
+     * the on-disk files are the live upgrade bridge — a site still at an old #__schemas version
+     * executes them from this same folder to reach the current schema.
+     *
+     * The shipped set is read from the extracted package rather than hardcoded, so re-adding a
+     * retired filename can never delete a live file.
+     */
+    private function removeObsoleteSchemaUpdates($parent): void
+    {
+        $installed = JPATH_ADMINISTRATOR . '/components/com_j2commerce/sql/updates/mysql';
+        $shipped   = $parent->getParent()->getPath('source')
+            . '/administrator/components/com_j2commerce/sql/updates/mysql';
+
+        if (!is_dir($installed) || !is_dir($shipped)) {
+            return;
+        }
+
+        $keep = array_flip(array_map('basename', glob($shipped . '/*.sql') ?: []));
+
+        // An unreadable source must never be read as "the package ships nothing".
+        if (!$keep) {
+            return;
+        }
+
+        foreach (glob($installed . '/*.sql') ?: [] as $path) {
+            $file = basename($path);
+
+            // Only names matching the generated delta pattern are ever removed, so an
+            // unrelated .sql dropped in this folder by hand is left alone.
+            if (isset($keep[$file]) || !preg_match('/^\d+\.\d+\.\d+(\.\d+)?(-\d{4}-\d{2}-\d{2})?(-\d+)?\.sql$/D', $file)) {
+                continue;
+            }
+
+            if (@unlink($path)) {
+                $this->debugLog("UPDATE: removed obsolete schema update file {$file}");
             }
         }
     }
@@ -281,6 +333,7 @@ class Com_J2commerceInstallerScript extends InstallerScript
         $this->seedCustomAclActions();
         $this->seedStockCommitted();
         $this->repairVariantAvailability();
+        $this->repairUploadsClientIp();
         $this->removeLegacyDebugLog();
 
         $this->debugLog("=== POSTFLIGHT END ===");
@@ -323,6 +376,54 @@ class Com_J2commerceInstallerScript extends InstallerScript
         } catch (\Throwable $e) {
             $this->debugLog('AVAILABILITY: repair failed (see the j2commerce log)');
             Log::add('Variant availability repair failed: ' . $e->getMessage(), Log::WARNING, 'j2commerce');
+        }
+    }
+
+    /**
+     * Restore #__j2commerce_uploads.client_ip when the 6.5.0-2026-07-30 delta skipped it.
+     * That ALTER is marked CAN FAIL, so a site can pass the update with the column absent —
+     * and the column is the upload throttle's whole counter: without it the cap answers
+     * "under the limit" to every request and no caller can tell that apart from a real
+     * count. Idempotent; the delta is left in place for sites where it did land.
+     */
+    private function repairUploadsClientIp(): void
+    {
+        $db = Factory::getContainer()->get(DatabaseInterface::class);
+
+        try {
+            if (isset($db->getTableColumns('#__j2commerce_uploads', true)['client_ip'])) {
+                return;
+            }
+
+            $db->setQuery(
+                'ALTER TABLE ' . $db->quoteName('#__j2commerce_uploads')
+                . ' ADD COLUMN ' . $db->quoteName('client_ip') . ' varchar(64) NOT NULL DEFAULT ' . $db->quote('')
+                . " COMMENT 'Salted SHA-256 throttle key — u: user id, i: client IP; not reversible'"
+                . ' AFTER ' . $db->quoteName('file_size')
+            )->execute();
+
+            // Separate statement: an install that somehow carries the index but not the
+            // column must not lose the column to the index failing.
+            try {
+                $db->setQuery(
+                    'ALTER TABLE ' . $db->quoteName('#__j2commerce_uploads')
+                    . ' ADD INDEX ' . $db->quoteName('idx_client_ip')
+                    . ' (' . $db->quoteName('client_ip') . ', ' . $db->quoteName('created_on') . ')'
+                )->execute();
+            } catch (\Throwable $e) {
+                $this->debugLog('UPLOADS CLIENT_IP: column added, index already present');
+            }
+
+            $this->debugLog('UPLOADS CLIENT_IP: column restored — the upload throttle can count again');
+        } catch (\Throwable $e) {
+            // Left to the runtime warning hasClientIpColumn() already logs on every probe.
+            $this->debugLog('UPLOADS CLIENT_IP: repair failed (see the j2commerce log)');
+            Log::add(
+                'Could not add #__j2commerce_uploads.client_ip; the upload rate limit stays off: '
+                    . $e->getMessage(),
+                Log::WARNING,
+                'j2commerce'
+            );
         }
     }
 
@@ -816,7 +917,7 @@ class Com_J2commerceInstallerScript extends InstallerScript
         // fallback for a value that normalises away entirely (a lone '/'), so the installer
         // and the runtime never disagree about which directory the config names.
         $relative = trim(str_replace('\\', '/', $this->readAttachmentFolderPath()), '/');
-        $relative = $relative !== '' ? $relative : AttachmentDenyFileHelper::DEFAULT_PATH;
+        $relative = $relative !== '' ? $relative : AttachmentDenyFileHelper::defaultPath();
         $resolved = $this->resolveAttachmentRoot($relative);
 
         // Nothing is written for a path that will not confine. Returning here leaves the tree
@@ -840,7 +941,7 @@ class Com_J2commerceInstallerScript extends InstallerScript
         $owned = AttachmentDenyFileHelper::ownsTree(
             $root,
             $createdNow,
-            $relative === AttachmentDenyFileHelper::DEFAULT_PATH
+            $relative === AttachmentDenyFileHelper::defaultPath()
         );
 
         foreach (['', '/tmp', '/orders'] as $sub) {
@@ -855,7 +956,13 @@ class Com_J2commerceInstallerScript extends InstallerScript
         }
 
         // Deny the whole tree: every legitimate read is streamed by PHP, nothing links to a URL here.
-        AttachmentDenyFileHelper::writeDenyPair($root, $owned, fn (string $message) => $this->debugLog($message));
+        AttachmentDenyFileHelper::writeDenyPair($root, $relative, $owned, fn (string $message) => $this->debugLog($message));
+
+        // Recorded once the tree is known to resolve, so the site keeps naming this directory
+        // instead of re-deriving it: the derived default follows Joomla's own file storage
+        // location and the presence of the legacy tree, either of which can move afterwards
+        // and leave already-stored files unresolvable and outside the retention cleanup.
+        $this->persistAttachmentFolderPath($relative);
 
         if (!$owned) {
             // The tree stays usable for uploads but carries no deny pair, and the README is
@@ -872,45 +979,96 @@ class Com_J2commerceInstallerScript extends InstallerScript
             return;
         }
 
-        $readme = <<<'README'
-# J2Commerce Customer Upload Storage
-
-This directory holds customer-supplied files attached to orders (product-option uploads and checkout uploads).
-
-- `tmp/{cart_id}/` — uploads bound to in-progress carts; cleaned by the `j2commerce.cleanupOrderUploads` scheduled task once `expires_on` passes.
-- `orders/{order_id}/` — uploads attached to a placed order; cleaned by the same task per configured retention.
-
-## Web access
-
-Nothing in this tree is meant to be fetched by URL. Files are streamed by PHP after an
-authorisation check — `OrderfileController` for admin order attachments, `MyprofileController`
-for a customer's own downloads.
-
-- `.htaccess` denies every request under this tree on Apache (`Require all denied`, with the
-  pre-2.4 `Order allow,deny` form for older servers), and separately blocks executable
-  extensions in case the blanket rule is overridden by the vhost.
-- `web.config` denies every request under this tree on IIS and disables handlers.
-
-Both files only take effect if the web server is configured to honour them — Apache needs
-`AllowOverride` to permit `Limit`/`AuthConfig` in this path, and IIS needs the URL
-Authorization feature installed. Verify by requesting a known filename in a browser: you
-should get 403, not the file.
-
-## Nginx equivalent
-
-Nginx reads neither file. If your site is served by Nginx, add this to your server block:
-
-```nginx
-location ~ ^/files/com_j2commerce { deny all; return 403; }
-```
-
-Do not store anything in this tree manually — admin order views look up files by
-`#__j2commerce_uploads` row, not by filesystem scan.
-README;
-
-        $this->writeFileIfMissing($root . '/README.md', $readme);
-
         $this->debugLog("ENSURE FILES FOLDER: tree at {$root} ready");
+    }
+
+    /**
+     * Cover the downloadable product files that are already stored.
+     *
+     * ensureFilesFolder() denies the attachment root, but 'images' is an allowed download
+     * root too, and files recorded under it predate the save-side write — no later run
+     * would otherwise reach them until each product happens to be re-saved.
+     *
+     * @since  6.6.0
+     */
+    private function protectStoredDownloadFiles(): void
+    {
+        $helperFile = JPATH_ADMINISTRATOR . '/components/com_j2commerce/src/Helper/DownloadHelper.php';
+
+        if (!class_exists(DownloadHelper::class) && file_exists($helperFile)) {
+            require_once $helperFile;
+        }
+
+        if (!class_exists(DownloadHelper::class)) {
+            $this->debugLog('PROTECT DOWNLOAD FILES: DownloadHelper unavailable — skipped');
+
+            return;
+        }
+
+        // A fresh install has no table yet, and an update must not die here. It must not pass
+        // silently either: whoever ran the update is the only one in a position to act on it.
+        try {
+            DownloadHelper::protectRecordedFiles(fn (string $message) => $this->debugLog($message));
+        } catch (\Throwable $e) {
+            $this->debugLog('PROTECT DOWNLOAD FILES: skipped');
+
+            Log::add(
+                'Stored downloadable files were not checked for direct web access: ' . $e->getMessage(),
+                Log::ERROR,
+                'com_j2commerce'
+            );
+
+            Factory::getApplication()->enqueueMessage(
+                'J2Commerce could not check that the downloadable files already stored are denied direct '
+                    . 'web access. Open a product with downloadable files and save it to try again.',
+                'warning'
+            );
+
+            return;
+        }
+
+        $this->debugLog('PROTECT DOWNLOAD FILES: stored files checked');
+    }
+
+    /**
+     * Pin the resolved storage root into the attachmentfolderpath param when the component
+     * names none of its own, merged into the stored params rather than replacing them. The
+     * value written is the one every consumer resolves to right now, so nothing already on
+     * disk moves; what changes is that a later Global Configuration edit, or the legacy tree
+     * appearing or disappearing, no longer moves the root out from under stored files.
+     *
+     * @since  6.5.0
+     */
+    private function persistAttachmentFolderPath(string $relative): void
+    {
+        $db = Factory::getContainer()->get(DatabaseInterface::class);
+
+        $query = $db->getQuery(true)
+            ->select($db->quoteName('params'))
+            ->from($db->quoteName('#__extensions'))
+            ->where($db->quoteName('element') . ' = ' . $db->quote('com_j2commerce'))
+            ->where($db->quoteName('type') . ' = ' . $db->quote('component'));
+        $db->setQuery($query);
+
+        $registry = new Registry((string) ($db->loadResult() ?: ''));
+
+        if (trim((string) $registry->get('attachmentfolderpath', '')) !== '') {
+            return;
+        }
+
+        $registry->set('attachmentfolderpath', $relative);
+        $params = $registry->toString();
+
+        $update = $db->getQuery(true)
+            ->update($db->quoteName('#__extensions'))
+            ->set($db->quoteName('params') . ' = :params')
+            ->where($db->quoteName('element') . ' = ' . $db->quote('com_j2commerce'))
+            ->where($db->quoteName('type') . ' = ' . $db->quote('component'))
+            ->bind(':params', $params);
+        $db->setQuery($update);
+        $db->execute();
+
+        $this->debugLog("ENSURE FILES FOLDER: recorded attachmentfolderpath = {$relative}");
     }
 
     /**
@@ -964,7 +1122,7 @@ README;
     /** Read attachmentfolderpath from com_j2commerce params with safe fallback. */
     private function readAttachmentFolderPath(): string
     {
-        $default = AttachmentDenyFileHelper::DEFAULT_PATH;
+        $default = AttachmentDenyFileHelper::defaultPath();
         $db      = Factory::getContainer()->get(DatabaseInterface::class);
 
         $query = $db->getQuery(true)

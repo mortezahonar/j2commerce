@@ -153,7 +153,7 @@ class HtmlView extends BaseHtmlView
         $this->formattedRevenue = CurrencyHelper::format($this->totalRevenue);
 
         $params     = ComponentHelper::getParams('com_j2commerce');
-        $dateFormat = $params->get('date_format', 'Y-m-d H:i:s');
+        $dateFormat = $params->get('date_format', 'Y-m-d');
 
         // Pass data to JavaScript
         if ($this->canViewReports) {
@@ -383,7 +383,8 @@ JS);
 
         if (!SetupGuideHelper::isComplete()) {
             HTMLHelper::_('bootstrap.offcanvas', '#j2commerce-setup-guide');
-            $wa->registerAndUseScript('com_j2commerce.setup-guide', 'media/com_j2commerce/js/administrator/setup-guide.js', [], ['defer' => true], ['com_j2commerce.modal-coordinator']);
+            $wa->registerAndUseScript('com_j2commerce.dom', 'media/com_j2commerce/js/site/j2commerce-dom.js', [], ['defer' => true]);
+            $wa->registerAndUseScript('com_j2commerce.setup-guide', 'media/com_j2commerce/js/administrator/setup-guide.js', [], ['defer' => true], ['com_j2commerce.modal-coordinator', 'com_j2commerce.dom']);
             $wa->registerAndUseStyle('com_j2commerce.setup-guide.css', 'media/com_j2commerce/css/administrator/setup-guide.css');
             $this->getDocument()->addScriptOptions('com_j2commerce.setupGuide', [
                 'isRtl' => Factory::getApplication()->getLanguage()->isRtl(),

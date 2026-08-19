@@ -7,7 +7,7 @@
     <license>GNU General Public License version 2 or later; see LICENSE.txt</license>
     <authorEmail>support@j2commerce.com</authorEmail>
     <authorUrl>https://www.j2commerce.com</authorUrl>
-    <version>6.2.2</version>
+    <version>6.2.3</version>
     <description>MOD_J2COMMERCE_RELATEDPRODUCTS_DESC</description>
     <namespace path="src">J2Commerce\Module\RelatedProducts</namespace>
 
@@ -187,7 +187,7 @@
 
             <fieldset name="display" label="MOD_J2COMMERCE_RELATEDPRODUCTS_FIELDSET_DISPLAY">
 
-                <field name="subtemplate" type="Subtemplate" default="app_bootstrap5"
+                <field name="subtemplate" type="Subtemplate" default="auto" show_auto="1"
                     label="MOD_J2COMMERCE_RELATEDPRODUCTS_FIELD_SUBTEMPLATE"
                     description="MOD_J2COMMERCE_RELATEDPRODUCTS_FIELD_SUBTEMPLATE_DESC" />
 
@@ -248,6 +248,14 @@
                 <field name="list_show_product_stock" type="radio" layout="joomla.form.field.radio.switcher" default="0"
                     filter="integer"
                     label="MOD_J2COMMERCE_RELATEDPRODUCTS_FIELD_SHOW_STOCK">
+                    <option value="0">JNO</option>
+                    <option value="1">JYES</option>
+                </field>
+
+                <field name="list_collapsed_options" type="radio" layout="joomla.form.field.radio.switcher" default="1"
+                    filter="integer"
+                    label="MOD_J2COMMERCE_RELATEDPRODUCTS_FIELD_COLLAPSED_OPTIONS"
+                    description="MOD_J2COMMERCE_RELATEDPRODUCTS_FIELD_COLLAPSED_OPTIONS_DESC">
                     <option value="0">JNO</option>
                     <option value="1">JYES</option>
                 </field>

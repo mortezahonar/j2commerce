@@ -17,6 +17,7 @@ namespace J2Commerce\Component\J2commerce\Administrator\Helper;
 use Joomla\CMS\Component\ComponentHelper;
 use Joomla\CMS\Factory;
 use Joomla\CMS\Language\Text;
+use Joomla\CMS\Log\Log;
 use Joomla\CMS\Mail\MailerFactoryInterface;
 use Joomla\CMS\Uri\Uri;
 use Joomla\CMS\User\User;
@@ -338,7 +339,8 @@ class UserHelper
 
         if ($autoregister) {
             if (!$user->save()) {
-                Factory::getApplication()->enqueueMessage($user->getError(), 'error');
+                Log::add('UserHelper autoregister save failed: ' . $user->getError(), Log::ERROR, 'com_j2commerce');
+                Factory::getApplication()->enqueueMessage(Text::_('COM_J2COMMERCE_ERR_GENERIC'), 'error');
 
                 return null;
             }
@@ -410,7 +412,7 @@ class UserHelper
             $mailer->addRecipient($email);
             $mailer->setSubject($subject);
             $mailer->setBody($message);
-            $mailer->setSender([$mailfrom, $fromname]);
+            $mailer->setSender([$mailfrom, $fromname, false]);
 
             return (bool) $mailer->send();
         } catch (\Exception $e) {

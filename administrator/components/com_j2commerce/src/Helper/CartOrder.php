@@ -274,7 +274,9 @@ class CartOrder
         $this->loadVouchers();
         $this->calculateDiscountTotals();
         $this->loadShipping();
+        $this->applyVoucherToShipping();
         $this->loadFees();
+        $this->quantizeTotals();
     }
 
     /**
@@ -572,97 +574,33 @@ class CartOrder
                 $item->orderitem_discount_tax = 0.0;
             }
 
-            if ($pricing) {
-                $itemPrice = (float) ($pricing->price ?? 0) + (float) ($item->option_price ?? 0);
+            // A product type with no cart behaviour of its own reaches here with no pricing
+            // object, so the stored variant price stands in for it. That line is charged like
+            // any other, so it is taxed like any other: the tax below runs off taxprofile_id,
+            // which the cart-items query carries for every line whatever its type.
+            $itemPrice = $pricing
+                ? (float) ($pricing->price ?? 0)
+                : (float) ($item->price ?? $item->variant_price ?? 0);
 
-                // Allow plugins to modify item price and add discounts
-                // onJ2CommerceGetDiscountedPrice signature: (&$price, &$item, $add_totals, &$order)
-                // Plugins can modify $price by reference and set $item->orderitem_discount
-                J2CommerceHelper::plugin()->event('GetDiscountedPrice', [
-                    &$itemPrice,
-                    &$item,
-                    true, // $add_totals - accumulate discount totals
-                    $this, // $order - the CartOrder object
-                ]);
+            $itemPrice += (float) ($item->option_price ?? 0);
 
-                $subtotal += $itemPrice * $quantity;
+            // Allow plugins to modify item price and add discounts
+            // onJ2CommerceGetDiscountedPrice signature: (&$price, &$item, $add_totals, &$order)
+            // Plugins can modify $price by reference and set $item->orderitem_discount
+            J2CommerceHelper::plugin()->event('GetDiscountedPrice', [
+                &$itemPrice,
+                &$item,
+                true, // $add_totals - accumulate discount totals
+                $this, // $order - the CartOrder object
+            ]);
 
-                // Calculate tax using taxprofile_id and customer geozone
-                $taxprofileId = (int) ($item->taxprofile_id ?? 0);
+            // The price the subtotal is built from, after any plugin reduced it. saveOrderItems()
+            // reads it back so the persisted line cannot silently revert to the undiscounted
+            // pricing->price and leave SUM(orderitem_finalprice) above order_subtotal.
+            $item->orderitem_effective_price = $itemPrice;
 
-                if ($taxprofileId > 0 && !empty($customerGeozones)) {
-                    $ratesets = $this->getTaxRatesForProfile($taxprofileId, $customerGeozones);
-
-                    if (!empty($ratesets)) {
-                        $itemTaxTotal = 0.0;
-                        $effectivePct = 0.0;
-
-                        // Sum total rate percent for inclusive extraction
-                        $totalRatePct = 0.0;
-                        foreach ($ratesets as $rate) {
-                            $totalRatePct += (float) ($rate->rate ?? $rate->tax_percent ?? 0);
-                        }
-
-                        // Total tax for this line (inclusive extraction or exclusive addition)
-                        $lineTotal    = $itemPrice * $quantity;
-                        $lineTaxTotal = $isIncludingTax
-                            ? ($totalRatePct > 0 ? $lineTotal * $totalRatePct / (100 + $totalRatePct) : 0.0)
-                            : $lineTotal * ($totalRatePct / 100);
-
-                        foreach ($ratesets as $rate) {
-                            $rateName    = (string) ($rate->name ?? $rate->taxrate_name ?? '');
-                            $ratePercent = (float) ($rate->rate ?? $rate->tax_percent ?? 0);
-                            $rateId      = (int) ($rate->j2commerce_taxrate_id ?? 0);
-
-                            // Distribute total tax proportionally across rates
-                            $rateAmount = $totalRatePct > 0
-                                ? $lineTaxTotal * ($ratePercent / $totalRatePct)
-                                : 0.0;
-
-                            $itemTaxTotal += $rateAmount;
-                            $effectivePct += $ratePercent;
-
-                            $rateKey = $rateName . '_' . $rateId;
-
-                            if (!isset($taxRates[$rateKey])) {
-                                $taxRates[$rateKey] = (object) [
-                                    'taxprofile_id'   => $taxprofileId,
-                                    'taxprofile_name' => (string) ($rate->taxprofile_name ?? ''),
-                                    'taxrate_name'    => $rateName,
-                                    'tax_amount'      => 0.0,
-                                    'tax_percent'     => $ratePercent,
-                                ];
-                            }
-
-                            $taxRates[$rateKey]->tax_amount += $rateAmount;
-                        }
-
-                        $taxTotal += $itemTaxTotal;
-                        $item->orderitem_tax         = $itemTaxTotal;
-                        $item->orderitem_tax_percent = $effectivePct;
-                    } else {
-                        $item->orderitem_tax         = 0.0;
-                        $item->orderitem_tax_percent = 0.0;
-                    }
-                } else {
-                    $item->orderitem_tax         = 0.0;
-                    $item->orderitem_tax_percent = 0.0;
-                }
-            } else {
-                $itemPrice = (float) ($item->price ?? $item->variant_price ?? 0) + (float) ($item->option_price ?? 0);
-
-                // Allow plugins to modify item price even for items without pricing object
-                J2CommerceHelper::plugin()->event('GetDiscountedPrice', [
-                    &$itemPrice,
-                    &$item,
-                    true,
-                    $this,
-                ]);
-
-                $subtotal += $itemPrice * $quantity;
-                $item->orderitem_tax         = 0.0;
-                $item->orderitem_tax_percent = 0.0;
-            }
+            $subtotal += $itemPrice * $quantity;
+            $taxTotal += $this->applyLineTax($item, $itemPrice * $quantity, $customerGeozones, (bool) $isIncludingTax, $taxRates);
         }
 
         $this->order_subtotal = $subtotal;
@@ -671,6 +609,88 @@ class CartOrder
         // When prices are stored inclusive of tax the subtotal already contains the tax;
         // adding taxTotal again would double-count it.
         $this->order_total = $isIncludingTax ? $subtotal : $subtotal + $taxTotal;
+    }
+
+    /**
+     * Resolve one line's tax, accumulate it into the per-rate rows and return its total.
+     *
+     * @param   object  $item              The cart line (orderitem_tax and orderitem_tax_percent are set on it).
+     * @param   float   $lineTotal         The line's charged amount, quantity included.
+     * @param   array   $customerGeozones  Geozones resolved once for the whole order.
+     * @param   bool    $isIncludingTax    Whether stored prices already contain the tax.
+     * @param   array   $taxRates          Per-rate rows, keyed by rate name and id, accumulated by reference.
+     *
+     * @return  float  The tax owed on this line.
+     *
+     * @since   6.5.2
+     */
+    private function applyLineTax(
+        object $item,
+        float $lineTotal,
+        array $customerGeozones,
+        bool $isIncludingTax,
+        array &$taxRates
+    ): float {
+        $taxprofileId = (int) ($item->taxprofile_id ?? 0);
+
+        $ratesets = $taxprofileId > 0 && !empty($customerGeozones)
+            ? $this->getTaxRatesForProfile($taxprofileId, $customerGeozones)
+            : [];
+
+        if (empty($ratesets)) {
+            $item->orderitem_tax         = 0.0;
+            $item->orderitem_tax_percent = 0.0;
+
+            return 0.0;
+        }
+
+        // Sum total rate percent for inclusive extraction
+        $totalRatePct = 0.0;
+
+        foreach ($ratesets as $rate) {
+            $totalRatePct += (float) ($rate->rate ?? $rate->tax_percent ?? 0);
+        }
+
+        // Total tax for this line (inclusive extraction or exclusive addition)
+        $lineTaxTotal = $isIncludingTax
+            ? ($totalRatePct > 0 ? $lineTotal * $totalRatePct / (100 + $totalRatePct) : 0.0)
+            : $lineTotal * ($totalRatePct / 100);
+
+        $itemTaxTotal = 0.0;
+        $effectivePct = 0.0;
+
+        foreach ($ratesets as $rate) {
+            $rateName    = (string) ($rate->name ?? $rate->taxrate_name ?? '');
+            $ratePercent = (float) ($rate->rate ?? $rate->tax_percent ?? 0);
+            $rateId      = (int) ($rate->j2commerce_taxrate_id ?? 0);
+
+            // Distribute total tax proportionally across rates
+            $rateAmount = $totalRatePct > 0
+                ? $lineTaxTotal * ($ratePercent / $totalRatePct)
+                : 0.0;
+
+            $itemTaxTotal += $rateAmount;
+            $effectivePct += $ratePercent;
+
+            $rateKey = $rateName . '_' . $rateId;
+
+            if (!isset($taxRates[$rateKey])) {
+                $taxRates[$rateKey] = (object) [
+                    'taxprofile_id'   => $taxprofileId,
+                    'taxprofile_name' => (string) ($rate->taxprofile_name ?? ''),
+                    'taxrate_name'    => $rateName,
+                    'tax_amount'      => 0.0,
+                    'tax_percent'     => $ratePercent,
+                ];
+            }
+
+            $taxRates[$rateKey]->tax_amount += $rateAmount;
+        }
+
+        $item->orderitem_tax         = $itemTaxTotal;
+        $item->orderitem_tax_percent = $effectivePct;
+
+        return $itemTaxTotal;
     }
 
     /**
@@ -690,16 +710,31 @@ class CartOrder
      */
     protected function recalculateTaxAfterDiscounts(): void
     {
-        // Combine order_discount (coupons/vouchers) and discount_cart (bulk discounts)
-        $totalDiscount = $this->order_discount + $this->discount_cart;
+        // A voucher is a payment instrument, not a price reduction: it settles part of what is
+        // owed and leaves the goods valued — and taxed — in full. Coupons and plugin cart
+        // discounts do reduce the price, so only those shrink the taxable base.
+        $voucherDiscount = 0.0;
+
+        foreach ($this->vouchers as $voucher) {
+            $voucherDiscount += (float) ($voucher->discount ?? 0);
+        }
+
+        $totalDiscount   = $this->order_discount + $this->discount_cart;
+        $taxableDiscount = max(0.0, $totalDiscount - $voucherDiscount);
+
+        // loadCoupons()/loadVouchers() already took their own discount off order_total the
+        // moment they applied it, so only the cart-discount half is still owed here. The tax
+        // ratio below uses the price-reducing figure — subtracting the full one from the total
+        // charged the coupon twice.
+        $pendingDiscount = $this->discount_cart;
 
         // No discounts or no subtotal — nothing to adjust
         if ($totalDiscount <= 0 || $this->order_subtotal <= 0) {
             return;
         }
 
-        // Net taxable amount after all discounts (floored at zero)
-        $netTaxable = max(0.0, $this->order_subtotal - $totalDiscount);
+        // Net taxable amount after the price-reducing discounts (floored at zero)
+        $netTaxable = max(0.0, $this->order_subtotal - $taxableDiscount);
         $ratio      = $netTaxable / $this->order_subtotal;
 
         // Scale each tax rate entry proportionally
@@ -721,11 +756,178 @@ class CartOrder
             // For inclusive pricing, order_total = subtotal (tax is embedded).
             // Only the discount reduces the total; the tax reduction is already
             // captured proportionally within that discount amount.
-            $this->order_total -= $totalDiscount;
+            $this->order_total -= $pendingDiscount;
         } else {
             // For exclusive pricing, order_total = subtotal + tax.
             // Both the discount and the proportional tax reduction must be subtracted.
-            $this->order_total -= ($totalDiscount + $taxReduction);
+            $this->order_total -= ($pendingDiscount + $taxReduction);
+        }
+
+        // Discounts worth more than the cart floor the order at zero, the same as
+        // OrderModel::recalculateOrderTotals(). Left negative, OrderTable::check() refuses the row
+        // and the shopper meets a generic failure at the moment of paying.
+        $this->order_total = max(0.0, $this->order_total);
+    }
+
+    /**
+     * The single point at which money on this order acquires its final precision.
+     *
+     * Every component is rounded to the base currency's scale, and the total is then derived
+     * as the exact sum of those rounded components rather than rounded independently from the
+     * running float. Without this the total and the rows beneath it are rounded separately —
+     * six roundings against one — and are under no obligation to agree, so the figure quoted
+     * could differ by a cent from both the lines printed above it and the figure saveOrder()
+     * stores. Deriving the total from the parts makes those three the same number by
+     * construction, which is also what the confirm-time guard compares.
+     *
+     * Idempotent: re-running it on already-rounded components changes nothing, so callers that
+     * adjust the order after construction (applyPaymentSurcharge) can simply call it again.
+     *
+     * @return  void
+     *
+     * @since   6.1.0
+     */
+    public function quantizeTotals(): void
+    {
+        $scale = CurrencyHelper::getDecimalPlace(ConfigHelper::getDefaultCurrency());
+        $round = static fn (float $value): float => round($value, $scale);
+
+        // A line's tax is rounded where it is charged, saveOrderItems() persists it at that
+        // scale, and OrderModel::recalculateOrderTotals() sums those stored rows back into
+        // order_tax. So the cart settles on the same basis: round each line, then add. Rounding
+        // the per-rate total once instead gave the same cart two answers a cent apart depending
+        // on which side asked, and the confirm-step guard that compares a saved order against
+        // the cart it came from read that cent as a changed cart.
+        $lineTaxTotal = 0.0;
+        $hasLineTax   = false;
+
+        foreach ($this->items as $item) {
+            $lineTax             = $round((float) ($item->orderitem_tax ?? 0));
+            $item->orderitem_tax = $lineTax;
+            $lineTaxTotal += $lineTax;
+
+            if ($lineTax > 0.0) {
+                $hasLineTax = true;
+            }
+        }
+
+        // Per-profile tax rows are what the customer reads, so they are settled onto the same
+        // figure the total carries rather than rounded independently of it.
+        if ($hasLineTax) {
+            $this->order_tax = $lineTaxTotal;
+            $this->settleTaxRatesTo($lineTaxTotal, $scale);
+        } elseif (!empty($this->taxRates)) {
+            $taxTotal = 0.0;
+
+            foreach ($this->taxRates as $taxRate) {
+                $taxRate->tax_amount = $round((float) ($taxRate->tax_amount ?? 0));
+                $taxTotal += $taxRate->tax_amount;
+            }
+
+            $this->order_tax = $taxTotal;
+        } else {
+            $this->order_tax = $round($this->order_tax);
+        }
+
+        // Same treatment for the discount lines: each coupon, voucher and plugin cart discount
+        // is rounded where it is displayed, and the two aggregate columns are rebuilt from them.
+        $couponVoucherTotal = 0.0;
+
+        foreach ($this->coupons as $coupon) {
+            $coupon->discount = $round((float) ($coupon->discount ?? 0));
+            $couponVoucherTotal += $coupon->discount;
+        }
+
+        foreach ($this->vouchers as $voucher) {
+            $voucher->discount = $round((float) ($voucher->discount ?? 0));
+            $couponVoucherTotal += $voucher->discount;
+        }
+
+        $this->order_discount = $couponVoucherTotal;
+
+        $cartDiscountTotal = 0.0;
+        $renderedCodes     = false;
+
+        foreach ($this->coupon_discount_amounts as $code => $amount) {
+            if (!\is_string($code) || str_ends_with($code, '_title') || !is_numeric($amount)) {
+                continue;
+            }
+
+            $this->coupon_discount_amounts[$code] = $round((float) $amount);
+            $cartDiscountTotal += $this->coupon_discount_amounts[$code];
+            $renderedCodes = true;
+        }
+
+        // A legacy plugin may bump discount_cart without writing a per-code entry; keep its
+        // figure rather than zeroing a discount the shopper was given.
+        $this->discount_cart = $renderedCodes ? $cartDiscountTotal : $round($this->discount_cart);
+
+        $this->order_subtotal     = $round($this->order_subtotal);
+        $this->order_shipping     = $round($this->order_shipping);
+        $this->order_shipping_tax = $round($this->order_shipping_tax);
+
+        if ($this->shippingRate !== null) {
+            $this->shippingRate->ordershipping_price = $round((float) ($this->shippingRate->ordershipping_price ?? 0));
+            $this->shippingRate->ordershipping_extra = $round((float) ($this->shippingRate->ordershipping_extra ?? 0));
+            $this->shippingRate->ordershipping_tax   = $this->order_shipping_tax;
+        }
+
+        // Fees live in the session and are read fresh on every call, so they are rounded here
+        // rather than written back — order_surcharge is the sum of what each fee row displays.
+        $surcharge = 0.0;
+
+        foreach ($this->get_fees() as $fee) {
+            $surcharge += $round((float) ($fee->amount ?? 0)) + $round((float) ($fee->tax ?? 0));
+        }
+
+        $this->order_surcharge = $surcharge;
+
+        // Tax-inclusive prices already carry the tax inside the subtotal and the shipping price,
+        // so neither tax component is added again.
+        $isIncludingTax = (int) J2CommerceHelper::config()->get('config_including_tax', 0);
+
+        $total = $this->order_subtotal
+            + $this->order_shipping
+            + $this->order_surcharge
+            - $this->order_discount
+            - $this->discount_cart;
+
+        if (!$isIncludingTax) {
+            $total += $this->order_tax + $this->order_shipping_tax;
+        }
+
+        $this->order_total = max(0.0, $round($total));
+    }
+
+    /**
+     * Round the displayed tax rows and put the rounding residual on the largest of them, so the
+     * rows the customer reads add up to the tax the total carries.
+     */
+    private function settleTaxRatesTo(float $target, int $scale): void
+    {
+        if (empty($this->taxRates)) {
+            return;
+        }
+
+        $assigned   = 0.0;
+        $largestKey = null;
+        $largestAmt = -1.0;
+
+        foreach ($this->taxRates as $key => $taxRate) {
+            $amount              = round((float) ($taxRate->tax_amount ?? 0), $scale);
+            $taxRate->tax_amount = $amount;
+            $assigned += $amount;
+
+            if ($amount > $largestAmt) {
+                $largestAmt = $amount;
+                $largestKey = $key;
+            }
+        }
+
+        $residual = round($target - $assigned, $scale);
+
+        if ($largestKey !== null && abs($residual) >= 10 ** -$scale / 2) {
+            $this->taxRates[$largestKey]->tax_amount = max(0.0, round($largestAmt + $residual, $scale));
         }
     }
 
@@ -742,7 +944,11 @@ class CartOrder
         // No shipping address entered yet — fall back to the store's own address so that
         // tax rates (and the tax line in the cart totals) are visible from the first page load,
         // consistent with how displayPrice() computes tax on product/category pages.
-        if (empty($geozones)) {
+        //
+        // A store set to "No Address" asks for the opposite: nothing is taxed until the shopper
+        // says where the order is going. ProductHelper::getTaxRateForProfile() reads the same
+        // setting, so the catalogue and the cart answer the same way on the same request.
+        if (empty($geozones) && ConfigHelper::getTaxDefaultAddress() !== 'noaddress') {
             $storeAddress            = TaxHelper::getStoreAddress();
             $this->customerCountryId = (int) $storeAddress->country_id;
             $this->customerZoneId    = (int) $storeAddress->zone_id;
@@ -852,6 +1058,65 @@ class CartOrder
     }
 
     /**
+     * The tax rows this order presents, as opposed to the rates it was calculated from.
+     *
+     * With `combine_tax_calculations` on, shipping tax joins the product tax entry that shares
+     * its profile (or takes an entry of its own where the profile differs) and there is one
+     * tax figure per profile. With it off, shipping tax stays out of these rows and is shown
+     * on its own line from order_shipping_tax.
+     *
+     * One method answers for the live cart, the persisted #__j2commerce_ordertaxes rows and
+     * the confirmation page, so a store cannot be quoted a split total and sent a combined one.
+     *
+     * @return  array<int, object>
+     *
+     * @since   6.1.0
+     */
+    private function buildDisplayTaxRates(): array
+    {
+        $displayRates = [];
+
+        foreach ($this->taxRates as $taxRate) {
+            $displayRates[] = \is_object($taxRate) ? clone $taxRate : (object) $taxRate;
+        }
+
+        $combineTax = (int) J2CommerceHelper::config()->get('combine_tax_calculations', 1);
+
+        if (!$combineTax || $this->order_shipping_tax <= 0 || !$this->shippingRate) {
+            return $displayRates;
+        }
+
+        $shippingTaxClassId = $this->getShippingTaxClassId();
+
+        if ($shippingTaxClassId <= 0) {
+            return $displayRates;
+        }
+
+        foreach ($displayRates as $rate) {
+            if ((int) ($rate->taxprofile_id ?? 0) === $shippingTaxClassId) {
+                $rate->tax_amount += $this->order_shipping_tax;
+
+                return $displayRates;
+            }
+        }
+
+        // Shipping uses a different tax profile — give it an entry of its own
+        $profileInfo = $this->getTaxProfileInfo($shippingTaxClassId);
+
+        if ($profileInfo) {
+            $displayRates[] = (object) [
+                'taxprofile_id'   => $shippingTaxClassId,
+                'taxprofile_name' => $profileInfo->taxprofile_name ?? '',
+                'taxrate_name'    => $profileInfo->taxrate_name ?? '',
+                'tax_amount'      => $this->order_shipping_tax,
+                'tax_percent'     => (float) ($profileInfo->tax_percent ?? 0),
+            ];
+        }
+
+        return $displayRates;
+    }
+
+    /**
      * Load applied coupons from session/cart.
      *
      * @return  void
@@ -877,14 +1142,16 @@ class CartOrder
                         $couponModel->init();
 
                         if (!$couponModel->isValid($this)) {
-                            // Flag as expired — defer session removal to checkout validation
+                            // Flag as expired — defer session removal to checkout validation.
+                            // The reason is safe to carry: isValid() only relays its own
+                            // CouponRejection and answers everything else generically.
                             $this->coupons[] = (object) [
                                 'coupon_code' => $couponCode,
                                 'coupon_id'   => $coupon->j2commerce_coupon_id ?? 0,
                                 'discount'    => 0.0,
                                 'coupon_name' => $coupon->coupon_name ?? $couponCode,
                                 'is_expired'  => true,
-                                'error'       => $couponModel->getError(),
+                                'error'       => $couponModel->getError() ?: Text::_('COM_J2COMMERCE_COUPON_NOT_VALID'),
                             ];
 
                             return;
@@ -1036,15 +1303,88 @@ class CartOrder
             $this->order_shipping     = $shippingPrice + $shippingExtra;
             $this->order_shipping_tax = $shippingTax;
 
+            $isIncludingTax = (int) ComponentHelper::getParams('com_j2commerce')->get('config_including_tax', 0);
+
+            // A carrier that prices its rate remotely returns no tax and passes the method's
+            // tax class through instead, leaving shipping the one charge on the order whose
+            // class nothing resolves. Put it through the same rate lookup the product lines
+            // use, so one source answers for both and the figure shown here is the figure
+            // saveOrderShipping() writes.
+            //
+            // A source that priced shipping itself says so with shipping_tax_resolved, so a
+            // supply it taxed at exactly nothing keeps that nothing instead of collecting an
+            // estimate on top of it.
+            $taxResolved = !empty($shippingValues['shipping_tax_resolved']) || $shippingTax > 0.0;
+
+            if (!$taxResolved && $this->order_shipping > 0) {
+                $shippingTaxClassId = $this->getShippingTaxClassId();
+
+                if ($shippingTaxClassId > 0) {
+                    $this->order_shipping_tax = TaxHelper::computeTax(
+                        $this->order_shipping,
+                        $shippingTaxClassId,
+                        $this->getCustomerGeozones(),
+                        (bool) $isIncludingTax
+                    )->taxtotal;
+
+                    $this->shippingRate->ordershipping_tax = $this->order_shipping_tax;
+                }
+            }
+
             // For inclusive pricing, the shipping price already embeds the tax so we must
             // not add order_shipping_tax again — doing so would double-count and inflate
             // the order total by the VAT amount.
-            $isIncludingTax = (int) ComponentHelper::getParams('com_j2commerce')->get('config_including_tax', 0);
 
             if ($isIncludingTax) {
                 $this->order_total += $this->order_shipping;
             } else {
                 $this->order_total += $this->order_shipping + $this->order_shipping_tax;
+            }
+        }
+    }
+
+    /**
+     * Credit whatever the voucher has left against the postage, when the store allows it.
+     *
+     * loadVouchers() runs before the shipping charge exists, so it can only cap the voucher at
+     * the goods. This second pass is what the "Apply Voucher to Shipping" option turns on: the
+     * balance the goods did not consume settles the postage too, still capped by that balance
+     * and by the postage itself. With the option off — the default — the voucher stops at the
+     * goods, which is what the cart has always done.
+     *
+     * A voucher is a payment instrument, so the figure it settles never reduces the taxable
+     * base; recalculateTaxAfterDiscounts() subtracts voucher money out of that calculation and
+     * is unaffected by anything credited here.
+     */
+    protected function applyVoucherToShipping(): void
+    {
+        if ($this->vouchers === [] || !ConfigHelper::canApplyVoucherToShipping()) {
+            return;
+        }
+
+        $isIncludingTax = (int) J2CommerceHelper::config()->get('config_including_tax', 0);
+        $shippingCharge = $this->order_shipping + ($isIncludingTax ? 0.0 : $this->order_shipping_tax);
+
+        if ($shippingCharge <= 0.0) {
+            return;
+        }
+
+        foreach ($this->vouchers as $voucher) {
+            $applied   = (float) ($voucher->discount ?? 0);
+            $remaining = max(0.0, (float) ($voucher->balance ?? 0) - $applied);
+            $credit    = min($remaining, $shippingCharge);
+
+            if ($credit <= 0.0) {
+                continue;
+            }
+
+            $voucher->discount = $applied + $credit;
+            $this->order_discount += $credit;
+            $this->order_total = max(0.0, $this->order_total - $credit);
+            $shippingCharge -= $credit;
+
+            if ($shippingCharge <= 0.0) {
+                break;
             }
         }
     }
@@ -1104,18 +1444,46 @@ class CartOrder
             'shipping_tax'          => '0',
             'shipping_tax_class_id' => 0,
             'shipping_extra'        => '',
+            'shipping_tax_resolved' => false,
         ];
     }
 
     /**
-     * Re-resolve a shipping selection against a fresh GetShippingRates dispatch; monetary
-     * values always come from the plugin's rate, never from request input. Null on no match.
-     *
-     * @return  array<string, mixed>|null  Canonical shipping_values, or null when no rate matches.
+     * Whether a rate's tax figure is the rate's own answer rather than a blank waiting to be
+     * filled. A rate states an exact zero by carrying tax_resolved; any other zero is silence.
      *
      * @since   6.1.0
      */
-    public static function resolvePluginShippingRate(object $order, string $plugin, string $name, string $code): ?array
+    public static function rateTaxIsResolved(mixed $rate): bool
+    {
+        return \is_array($rate)
+            && (!empty($rate['tax_resolved']) || (float) ($rate['tax'] ?? 0) > 0);
+    }
+
+    /**
+     * A plugin returning a negative price, tax, or extra is broken — refuse to bind it.
+     * Takes mixed so filtering a rate list cannot fatal on a malformed member.
+     *
+     * @since   6.1.0
+     */
+    public static function rateChargesAreValid(mixed $rate): bool
+    {
+        return \is_array($rate)
+            && (float) ($rate['price'] ?? 0) >= 0
+            && (float) ($rate['tax'] ?? 0) >= 0
+            && (float) ($rate['extra'] ?? 0) >= 0;
+    }
+
+    /**
+     * What the plugins offer this order, after the exclusions the merchant configured. A
+     * carrier plugin answers this with a billed API call, so a caller that needs both the
+     * list and a selection out of it takes the list once and matches against it.
+     *
+     * @return  array<int, array<string, mixed>>
+     *
+     * @since   6.1.0
+     */
+    public static function collectShippingRates(object $order): array
     {
         $rates = [];
 
@@ -1134,9 +1502,40 @@ class CartOrder
             'order' => $order,
         ]);
         Factory::getContainer()->get(DispatcherInterface::class)->dispatch('onJ2CommerceFilterShippingRates', $filterEvent);
-        $rates = $filterEvent->getArgument('rates', $rates);
 
+        return $filterEvent->getArgument('rates', $rates);
+    }
+
+    /**
+     * Re-resolve a shipping selection against a fresh GetShippingRates dispatch; monetary
+     * values always come from the plugin's rate, never from request input. Null on no match.
+     *
+     * @return  array<string, mixed>|null  Canonical shipping_values, or null when no rate matches.
+     *
+     * @since   6.1.0
+     */
+    public static function resolvePluginShippingRate(object $order, string $plugin, string $name, string $code): ?array
+    {
+        return self::matchShippingRate(self::collectShippingRates($order), $plugin, $name, $code);
+    }
+
+    /**
+     * Bind a selection to a rate out of an offer list already in hand — the same match
+     * resolvePluginShippingRate() makes, for a caller that has paid for the dispatch.
+     *
+     * @param   array<int, mixed>  $rates  Offer list as collectShippingRates() returns it.
+     *
+     * @return  array<string, mixed>|null  Canonical shipping_values, or null when no rate matches.
+     *
+     * @since   6.1.0
+     */
+    public static function matchShippingRate(array $rates, string $plugin, string $name, string $code): ?array
+    {
         foreach ($rates as $rate) {
+            if (!\is_array($rate)) {
+                continue;
+            }
+
             if ((string) ($rate['element'] ?? '') !== $plugin || (string) ($rate['name'] ?? '') !== $name) {
                 continue;
             }
@@ -1147,23 +1546,19 @@ class CartOrder
                 continue;
             }
 
-            $price = (float) ($rate['price'] ?? 0);
-            $tax   = (float) ($rate['tax'] ?? 0);
-            $extra = (float) ($rate['extra'] ?? 0);
-
-            // A plugin returning a negative charge is broken — refuse to bind it.
-            if ($price < 0 || $tax < 0 || $extra < 0) {
+            if (!self::rateChargesAreValid($rate)) {
                 continue;
             }
 
             return [
                 'shipping_plugin'       => (string) ($rate['element'] ?? ''),
                 'shipping_name'         => (string) ($rate['name'] ?? ''),
-                'shipping_price'        => (string) $price,
+                'shipping_price'        => (string) (float) ($rate['price'] ?? 0),
                 'shipping_code'         => $rateCode,
-                'shipping_tax'          => (string) $tax,
+                'shipping_tax'          => (string) (float) ($rate['tax'] ?? 0),
                 'shipping_tax_class_id' => (int) ($rate['tax_class_id'] ?? 0),
-                'shipping_extra'        => (string) $extra,
+                'shipping_extra'        => (string) (float) ($rate['extra'] ?? 0),
+                'shipping_tax_resolved' => self::rateTaxIsResolved($rate),
             ];
         }
 
@@ -1206,8 +1601,13 @@ class CartOrder
     public function add_fee(string $name, float $amount, bool $taxable = false, $taxClassId = 0): void
     {
         $key = 'payment_' . $this->orderpayment_type;
-        // tax stays 0.0 for v1 (tax-free surcharge); taxClassId stored for forward use
-        self::addFee($key, $amount, $name, 0.0, (int) $taxClassId);
+        $tax = 0.0;
+
+        if ($taxable && (int) $taxClassId > 0) {
+            $tax = TaxHelper::computeTax($amount, (int) $taxClassId, $this->getCustomerGeozones())->taxtotal;
+        }
+
+        self::addFee($key, $amount, $name, $tax, (int) $taxClassId);
     }
 
     /** Legacy compatibility — called by payment plugins via $order->get_payment_method(). */
@@ -1245,34 +1645,24 @@ class CartOrder
         $session = Factory::getApplication()->getSession();
         $fees    = $session->get('order_fees', [], 'j2commerce');
 
-        // Roll back ALL prior payment_* fees from the live total + drop from session
+        // Drop ALL prior payment_* fees from the session
         foreach ($fees as $key => $fee) {
             if (str_starts_with((string) $key, 'payment_')) {
-                $this->order_surcharge -= (float) ($fee['amount'] ?? 0) + (float) ($fee['tax'] ?? 0);
-                $this->order_total -= (float) ($fee['amount'] ?? 0) + (float) ($fee['tax'] ?? 0);
                 unset($fees[$key]);
             }
         }
 
         $session->set('order_fees', $fees, 'j2commerce');
 
-        if ($this->orderpayment_type === '') {
-            return;
+        if ($this->orderpayment_type !== '') {
+            // Selected payment plugin's onCalculateFees() calls $order->add_fee() → session
+            J2CommerceHelper::plugin()->event('CalculateFees', [$this->orderpayment_type, $this]);
         }
 
-        // Selected payment plugin's onCalculateFees() calls $order->add_fee() → session
-        J2CommerceHelper::plugin()->event('CalculateFees', [$this->orderpayment_type, $this]);
-
-        // Fold the freshly-added payment fee into the total (match by ->plugin key)
-        $key = 'payment_' . $this->orderpayment_type;
-
-        foreach ($this->get_fees() as $fee) {
-            if (($fee->plugin ?? '') === $key) {
-                $this->order_surcharge += (float) $fee->amount + (float) $fee->tax;
-                $this->order_total += (float) $fee->amount + (float) $fee->tax;
-                break;
-            }
-        }
+        // The surcharge and the total are rebuilt from the fees now in the session rather than
+        // adjusted by hand, so switching payment method cannot leave a stale half of a fee
+        // behind and the total stays the sum of the parts the customer is shown.
+        $this->quantizeTotals();
     }
 
     /**
@@ -1707,6 +2097,10 @@ class CartOrder
      */
     public function saveOrder(): self
     {
+        // Settle the figures before any of them is written, so the row stored is the row the
+        // customer was shown. Idempotent — the constructor has already run it.
+        $this->quantizeTotals();
+
         $app     = Factory::getApplication();
         $session = $app->getSession();
         $user    = $app->getIdentity();
@@ -1750,15 +2144,15 @@ class CartOrder
         // Create the order record via OrderTable
         $orderTable = $mvcFactory->createTable('Order', 'Administrator');
 
-        // Round every stored money field to the base currency's decimal scale so the
-        // total is never over-precise (e.g. a 9.25% shipping tax yields 0.925 → a
-        // 3-decimal 39.925 total for a 2-decimal currency). Each field is rounded to
-        // the currency's own scale — 2 for USD/EUR, 0 for JPY, 3 for BHD/KWD — so the
-        // stored total matches what the gateway charges and every downstream sum
-        // (Balance Due, refunds, reports) reconciles exactly.
+        // Backstop only: quantizeTotals() has already rounded every one of these to the base
+        // currency's scale, so $money() is a no-op on anything it settled. It stays because a
+        // plugin may write one of these fields directly between that call and this bind.
         $moneyScale = CurrencyHelper::getDecimalPlace(ConfigHelper::getDefaultCurrency());
         $money      = static fn (float $value): float => round($value, $moneyScale);
 
+        // order_discount is written from the coupon and voucher half alone; a plugin discount
+        // lives in discount_cart and reaches the column through syncOrderDiscountTotal() below,
+        // which sums the persisted rows.
         $orderData = [
             'user_id'               => $userId,
             'user_email'            => $userEmail,
@@ -1790,8 +2184,10 @@ class CartOrder
         ];
 
         if (!$orderTable->bind($orderData) || !$orderTable->check() || !$orderTable->store()) {
+            Log::add('CartOrder order create failed: ' . $orderTable->getError(), Log::ERROR, 'com_j2commerce');
+
             throw new \RuntimeException(
-                Text::sprintf('COM_J2COMMERCE_ORDER_SAVE_ERROR', $orderTable->getError())
+                Text::sprintf('COM_J2COMMERCE_ORDER_SAVE_ERROR', Text::_('COM_J2COMMERCE_ERR_GENERIC'))
             );
         }
 
@@ -1806,8 +2202,10 @@ class CartOrder
         }
 
         if (!$orderTable->store()) {
+            Log::add('CartOrder order id/token store failed: ' . $orderTable->getError(), Log::ERROR, 'com_j2commerce');
+
             throw new \RuntimeException(
-                Text::sprintf('COM_J2COMMERCE_ORDER_SAVE_ERROR', $orderTable->getError())
+                Text::sprintf('COM_J2COMMERCE_ORDER_SAVE_ERROR', Text::_('COM_J2COMMERCE_ERR_GENERIC'))
             );
         }
 
@@ -1830,8 +2228,21 @@ class CartOrder
         // Save order shipping
         $this->saveOrderShipping($db, $orderId);
 
-        // Save order discounts (coupons + vouchers)
+        // Save order discounts (coupons + vouchers + plugin cart discounts)
         $this->saveOrderDiscounts($db, $orderId, $userId, $userEmail);
+
+        // orders.order_discount is a mirror of those rows, and it is the only discount input
+        // OrderModel::recalculateOrderTotals() reads. $this->order_discount carries the coupon
+        // and voucher half alone — a discount booked through increase_coupon_discount_amount()
+        // lives in $discount_cart — so writing the property would leave every plugin discount
+        // out of the column and any later recompute would rebuild order_total without it.
+        // Summing the persisted rows instead is also immune to a discount that was booked into
+        // both accumulators: saveOrderDiscounts() emits one row per code either way.
+        $discountSyncModel = $mvcFactory->createModel('Order', 'Administrator', ['ignore_request' => true]);
+
+        if ($discountSyncModel) {
+            $discountSyncModel->syncOrderDiscountTotal($orderId);
+        }
 
         // Save order fees (surcharges with names)
         $this->saveOrderFees($db, $orderId);
@@ -1874,7 +2285,8 @@ class CartOrder
      */
     protected function saveOrderItems(DatabaseInterface $db, string $orderId, int $userId): void
     {
-        $now = Factory::getDate()->toSql();
+        $now  = Factory::getDate()->toSql();
+        $rows = [];
 
         foreach ($this->items as $item) {
             // product_type must come from the cartitem. Never default to 'simple' —
@@ -1888,14 +2300,41 @@ class CartOrder
                 );
             }
 
-            $pricing           = $item->pricing ?? null;
-            $quantity          = (int) ($item->product_qty ?? 1);
-            $basePrice         = (float) ($pricing->price ?? $item->variant_price ?? 0);
-            $optionPrice       = (float) ($item->option_price ?? 0);
-            $perItemTax        = (float) ($pricing->tax ?? 0);
-            $itemTax           = $perItemTax * $quantity;
-            $finalPrice        = ($basePrice + $optionPrice) * $quantity;
-            $finalPriceWithTax = $finalPrice + $itemTax;
+            $pricing     = $item->pricing ?? null;
+            $quantity    = (int) ($item->product_qty ?? 1);
+            // Same fallback chain calculateTotals() used to build the price it handed the plugins,
+            // so an item without a pricing object cannot read as discounted here when it is not.
+            $basePrice   = (float) ($pricing->price ?? $item->price ?? $item->variant_price ?? 0);
+            $optionPrice = (float) ($item->option_price ?? 0);
+            $grossUnit   = $basePrice + $optionPrice;
+
+            // Only the discount a plugin baked into the price is a LINE discount. One booked
+            // through increase_coupon_discount_amount() is order-level money — it has its own
+            // orderdiscounts row and its own column, and subtracting it here as well would take
+            // it off the order twice.
+            $effectiveUnit = isset($item->orderitem_effective_price)
+                ? (float) $item->orderitem_effective_price
+                : $grossUnit;
+            $lineDiscount  = max(0.0, ($grossUnit - $effectiveUnit) * $quantity);
+            $finalPrice    = $grossUnit * $quantity - $lineDiscount;
+
+            // calculateTotals() already resolved this line's tax against the customer's geozone
+            // and the price the plugins left behind; pricing->tax is the pre-plugin per-unit
+            // figure and disagrees with order_tax whenever either applies.
+            $itemTax = isset($item->orderitem_tax)
+                ? (float) $item->orderitem_tax
+                : (float) ($pricing->tax ?? 0) * $quantity;
+
+            $lineDiscountTax = 0.0;
+
+            if ($lineDiscount > 0.0 && $finalPrice > 0.0 && $itemTax > 0.0) {
+                $lineDiscountTax = $lineDiscount * ($itemTax / $finalPrice);
+            }
+
+            $perItemTax        = $quantity > 0 ? $itemTax / $quantity : $itemTax;
+            $finalPriceWithTax = (int) J2CommerceHelper::config()->get('config_including_tax', 0)
+                ? $finalPrice
+                : $finalPrice + $itemTax;
 
             // Serialize item attributes for storage
             $attributes = '';
@@ -1921,8 +2360,8 @@ class CartOrder
                 'orderitem_taxprofile_id'          => (int) ($item->taxprofile_id ?? $pricing->taxprofile_id ?? 0),
                 'orderitem_per_item_tax'           => $perItemTax,
                 'orderitem_tax'                    => $itemTax,
-                'orderitem_discount'               => 0,
-                'orderitem_discount_tax'           => 0,
+                'orderitem_discount'               => $lineDiscount,
+                'orderitem_discount_tax'           => $lineDiscountTax,
                 'orderitem_price'                  => $basePrice,
                 'orderitem_option_price'           => $optionPrice,
                 'orderitem_finalprice'             => $finalPrice,
@@ -1935,6 +2374,12 @@ class CartOrder
                 'orderitem_weight_total'           => (string) (($item->weight ?? 0) * $quantity),
             ];
 
+            $rows[] = [$row, $item];
+        }
+
+        $this->scaleLineTaxToOrderTax($rows);
+
+        foreach ($rows as [$row, $item]) {
             // Storefront counterpart to the dispatch in OrderModel::addOrderItemFromVariant() — same event,
             // same by-reference contract, so one handler serves both write paths. The cart item travels with
             // the row because the shopper's selections live there, not on the order item being built.
@@ -1946,6 +2391,73 @@ class CartOrder
 
             $db->insertObject('#__j2commerce_orderitems', $row, 'j2commerce_orderitem_id');
         }
+    }
+
+    /**
+     * Bring the per-line tax in step with the order-level tax before the rows are written.
+     *
+     * recalculateTaxAfterDiscounts() scales order_tax down to the discounted base but leaves the
+     * per-line figures alone, and OrderModel::recalculateOrderTotals() prefers SUM(orderitem_tax)
+     * whenever it is positive — so without this, any later recompute of a discounted order rebuilds
+     * order_total with the undiscounted tax. The largest taxed line absorbs the rounding remainder,
+     * so the sum matches the stored order_tax exactly and no line can be driven negative by it.
+     *
+     * @param  array<int, array{0: object, 1: object}>  $rows  Row/item pairs, mutated in place.
+     */
+    private function scaleLineTaxToOrderTax(array $rows): void
+    {
+        $scale     = CurrencyHelper::getDecimalPlace(ConfigHelper::getDefaultCurrency());
+        $tolerance = 10 ** -$scale / 2;
+        $target    = round($this->order_tax, $scale);
+        $rawSum    = 0.0;
+
+        foreach ($rows as [$row]) {
+            $rawSum += (float) $row->orderitem_tax;
+        }
+
+        if ($rawSum <= 0.0 || abs($rawSum - $target) < $tolerance) {
+            return;
+        }
+
+        $ratio       = $target / $rawSum;
+        $assigned    = 0.0;
+        $largestKey  = null;
+        $largestTax  = 0.0;
+
+        foreach ($rows as $key => [$row]) {
+            if ((float) $row->orderitem_tax <= 0.0) {
+                continue;
+            }
+
+            $lineTax = round((float) $row->orderitem_tax * $ratio, $scale);
+            $this->setRowTax($row, $lineTax, $scale);
+            $assigned += $lineTax;
+
+            if ($lineTax > $largestTax) {
+                $largestTax = $lineTax;
+                $largestKey = $key;
+            }
+        }
+
+        if ($largestKey === null || abs($assigned - $target) < $tolerance) {
+            return;
+        }
+
+        $this->setRowTax($rows[$largestKey][0], max(0.0, round($largestTax + ($target - $assigned), $scale)), $scale);
+    }
+
+    /** Writes a line's tax and the two columns derived from it. */
+    private function setRowTax(object $row, float $lineTax, int $scale): void
+    {
+        $quantity = (int) $row->orderitem_quantity;
+
+        $row->orderitem_tax          = $lineTax;
+        $row->orderitem_per_item_tax = $quantity > 0 ? round($lineTax / $quantity, $scale + 2) : $lineTax;
+        // Tax-inclusive stores keep the tax inside the line price already; adding it again would
+        // report the line at price + tax.
+        $row->orderitem_finalprice_with_tax = (int) J2CommerceHelper::config()->get('config_including_tax', 0)
+            ? (float) $row->orderitem_finalprice
+            : (float) $row->orderitem_finalprice + $lineTax;
     }
 
     /**
@@ -2061,6 +2573,13 @@ class CartOrder
             $addressTable = $mvcFactory->createTable('Address', 'Administrator');
 
             if ($addressTable && $addressTable->load($addressId)) {
+                // Hold the row to the account the resolver was called for, matching
+                // TaxHelper::getCustomerAddress() and ShippingStandard::getShippingGeozones().
+                // Guest rows carry user_id = 0, so the match is only meaningful for a real account.
+                if ($userId > 0 && (int) ($addressTable->user_id ?? 0) !== $userId) {
+                    return [];
+                }
+
                 $data = [
                     'first_name' => $addressTable->first_name ?? '',
                     'last_name'  => $addressTable->last_name ?? '',
@@ -2142,46 +2661,10 @@ class CartOrder
      */
     protected function saveOrderTaxes(DatabaseInterface $db, string $orderId): void
     {
-        // Build display rates that include shipping tax merged in (mirrors the live-cart display
-        // logic in get_formatted_order_totals) so invoices, confirmation pages, and email
-        // templates show the full VAT amount including shipping VAT.
-        $displayRates = [];
-
-        foreach ($this->taxRates as $taxRate) {
-            $displayRates[] = clone $taxRate;
-        }
-
-        if ($this->order_shipping_tax > 0 && $this->shippingRate) {
-            $shippingTaxClassId = $this->getShippingTaxClassId();
-
-            if ($shippingTaxClassId > 0) {
-                $merged = false;
-
-                foreach ($displayRates as $rate) {
-                    if ((int) ($rate->taxprofile_id ?? 0) === $shippingTaxClassId) {
-                        $rate->tax_amount += $this->order_shipping_tax;
-                        $merged = true;
-                        break;
-                    }
-                }
-
-                if (!$merged) {
-                    $profileInfo = $this->getTaxProfileInfo($shippingTaxClassId);
-
-                    if ($profileInfo) {
-                        $displayRates[] = (object) [
-                            'taxprofile_id'   => $shippingTaxClassId,
-                            'taxprofile_name' => $profileInfo->taxprofile_name ?? '',
-                            'taxrate_name'    => $profileInfo->taxrate_name ?? '',
-                            'tax_amount'      => $this->order_shipping_tax,
-                            'tax_percent'     => (float) ($profileInfo->tax_percent ?? 0),
-                        ];
-                    }
-                }
-            }
-        }
-
-        foreach ($displayRates as $taxRate) {
+        // The persisted rows are the ones the confirmation page, the invoice and the order
+        // emails read back, so they are built by the same method the live cart displays from —
+        // including whether shipping tax belongs inside them or on a line of its own.
+        foreach ($this->buildDisplayTaxRates() as $taxRate) {
             $taxAmount = (float) ($taxRate->tax_amount ?? 0);
 
             if ($taxAmount <= 0) {
@@ -2495,50 +2978,9 @@ class CartOrder
         }
 
         // Tax totals — always show Tax Profile Name; combine shipping tax when enabled
-        if (!empty($this->taxRates) || ($combineTax && $this->order_shipping_tax > 0)) {
-            // Clone taxRates for display to avoid mutating calculated values
-            $displayRates = [];
+        $displayRates = $this->buildDisplayTaxRates();
 
-            foreach ($this->taxRates as $taxRate) {
-                if (\is_object($taxRate)) {
-                    $displayRates[] = clone $taxRate;
-                } else {
-                    $displayRates[] = (object) $taxRate;
-                }
-            }
-
-            // Combine shipping tax into matching product tax entry when enabled
-            if ($combineTax && $this->order_shipping_tax > 0 && $this->shippingRate) {
-                $shippingTaxClassId = $this->getShippingTaxClassId();
-
-                if ($shippingTaxClassId > 0) {
-                    $merged = false;
-
-                    foreach ($displayRates as $rate) {
-                        if ((int) ($rate->taxprofile_id ?? 0) === $shippingTaxClassId) {
-                            $rate->tax_amount += $this->order_shipping_tax;
-                            $merged = true;
-                            break;
-                        }
-                    }
-
-                    // Shipping uses a different tax profile — create a new entry
-                    if (!$merged) {
-                        $profileInfo = $this->getTaxProfileInfo($shippingTaxClassId);
-
-                        if ($profileInfo) {
-                            $displayRates[] = (object) [
-                                'taxprofile_id'   => $shippingTaxClassId,
-                                'taxprofile_name' => $profileInfo->taxprofile_name ?? '',
-                                'taxrate_name'    => $profileInfo->taxrate_name ?? '',
-                                'tax_amount'      => $this->order_shipping_tax,
-                                'tax_percent'     => (float) ($profileInfo->tax_percent ?? 0),
-                            ];
-                        }
-                    }
-                }
-            }
-
+        if (!empty($displayRates)) {
             foreach ($displayRates as $key => $taxRate) {
                 $taxAmount = (float) ($taxRate->tax_amount ?? 0);
                 // Use Tax Profile Name with Tax Rate Name as fallback
@@ -2670,11 +3112,10 @@ class CartOrder
         $amount = (float) ($discount->discount_amount ?? 0);
         $tax    = (float) ($discount->discount_tax ?? 0);
 
+        // increase_coupon_discount_amount() already books the amount into $discount_cart,
+        // which recalculateTaxAfterDiscounts() subtracts. Adding it to $order_discount here
+        // as well put the same money in both accumulators and took it off order_total twice.
         $this->increase_coupon_discount_amount($code, $amount, $tax);
-
-        // Add to order_discount for tax recalculation
-        $this->order_discount += $amount;
-        $this->order_discount_tax += $tax;
     }
 
     /**
@@ -2692,8 +3133,9 @@ class CartOrder
         // Allow plugins to add discount totals (bulk discounts, volume discounts, etc.)
         J2CommerceHelper::plugin()->event('CalculateDiscountTotals', [$this]);
 
-        // If plugins added discounts, recalculate tax on discounted amount
-        if ($this->discount_cart > 0) {
+        // Any discount shrinks the taxable base, so a coupon-only cart needs this pass too —
+        // gating it on the plugin half alone left those carts taxed on the undiscounted subtotal.
+        if (($this->order_discount + $this->discount_cart) > 0) {
             $this->recalculateTaxAfterDiscounts();
         }
     }

@@ -29,13 +29,18 @@ $productHelper = J2CommerceHelper::product();
 $platform = J2CommerceHelper::platform();
 $esc = static fn(string $value): string => htmlspecialchars($value, ENT_QUOTES, 'UTF-8');
 $optionsSummary = $productHelper::getOptionsSummary($options);
+$collapsedOptions = (bool) $params->get('list_collapsed_options', $params->get('collapsed_options', 1));
 
 ?>
 <div class="j2commerce-configurable-options uk-padding-small-top" id="configurable-options-<?php echo $productId; ?>">
+    <?php if ($collapsedOptions) : ?>
     <button class="uk-button uk-button-text uk-padding-remove j2commerce-configurable-button" type="button" uk-toggle="target: #collapseOptions<?php echo $productId; ?>; cls: uk-hidden" aria-expanded="false" aria-controls="collapseOptions<?php echo $productId; ?>">
         <?php echo $esc($optionsSummary); ?><span class="uk-margin-small-left fa-solid fa-chevron-down"></span>
     </button>
-    <div class="uk-hidden uk-padding-small-top" id="collapseOptions<?php echo $productId; ?>">
+    <?php else : ?>
+    <div class="j2commerce-options-summary uk-text-bold"><?php echo $esc($optionsSummary); ?></div>
+    <?php endif; ?>
+    <div class="<?php echo $collapsedOptions ? 'uk-hidden ' : ''; ?>uk-padding-small-top" id="collapseOptions<?php echo $productId; ?>">
         <?php foreach ($options as $option) : ?>
             <?php $optionId = (int) $option['productoption_id']; ?>
             <?php if (!empty($option['parent_id'])) continue; ?>
@@ -151,7 +156,7 @@ $optionsSummary = $productHelper::getOptionsSummary($options);
                 <b><?php echo $esc(Text::_($option['option_name'])); ?>:</b><br>
                 <?php foreach ($option['optionvalue'] as $option_value) : ?>
                     <?php $optionValueInputId = 'option-value-' . $productId . '-' . $optionId . '-' . (int) $option_value['product_optionvalue_id']; ?>
-                    <input type="checkbox"
+                    <input<?php echo !empty($option_value['product_optionvalue_default']) ? ' checked="checked"' : ''; ?> type="checkbox"
                            name="product_option[<?php echo $optionId; ?>][]"
                            value="<?php echo (int) $option_value['product_optionvalue_id']; ?>"
                            id="<?php echo $optionValueInputId; ?>" />

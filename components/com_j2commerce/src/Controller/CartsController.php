@@ -165,6 +165,7 @@ class CartsController extends BaseController
         $methods = J2CommerceHelper::plugin()->eventWithArray('GetShippingRates', [$order]);
 
         $methods = CartOrder::sortShippingRates($methods, ConfigHelper::autoApplyShippingRate());
+        $methods = array_values(array_filter($methods, [CartOrder::class, 'rateChargesAreValid']));
 
         $session->set('shipping_methods', $methods, 'j2commerce');
 
@@ -184,10 +185,12 @@ class CartsController extends BaseController
             if (($method['name'] ?? '') === $selectedName) {
                 $found = true;
 
-                // Sync tax data from fresh rate (amounts/class may have changed)
+                // Sync tax data from fresh rate (amounts/class may have changed). The resolved
+                // marker is rewritten alongside the amount so it always speaks for this rate.
                 $shippingValues['shipping_tax']          = $method['tax'] ?? 0;
                 $shippingValues['shipping_tax_class_id'] = $method['tax_class_id'] ?? 0;
                 $shippingValues['shipping_price']        = $method['price'] ?? 0;
+                $shippingValues['shipping_tax_resolved'] = CartOrder::rateTaxIsResolved($method);
                 $session->set('shipping_values', $shippingValues, 'j2commerce');
                 break;
             }
@@ -210,6 +213,7 @@ class CartsController extends BaseController
             'shipping_extra'        => $default['extra'],
             'shipping_code'         => $default['code'],
             'shipping_plugin'       => $default['element'],
+            'shipping_tax_resolved' => CartOrder::rateTaxIsResolved($default),
         ], 'j2commerce');
     }
 
@@ -252,7 +256,7 @@ class CartsController extends BaseController
             $this->startAjaxBuffer();
 
             if (!$this->validateAjaxToken()) {
-                $this->sendJsonResponse(['success' => false, 'message' => 'Invalid token']);
+                $this->sendJsonResponse(['success' => false, 'message' => Text::_('JINVALID_TOKEN')]);
             }
         } else {
             $this->checkToken();
@@ -285,7 +289,7 @@ class CartsController extends BaseController
             $cartUrl = $model->getCartUrl();
 
             if ($ajax) {
-                if (isset($json['success'])) {
+                if (!empty($json['success'])) {
                     if ($config->get('addtocart_action', 1) == 3) {
                         $json['redirect'] = $cartUrl;
                     }
@@ -490,7 +494,7 @@ class CartsController extends BaseController
         if ($model->deleteItem()) {
             $msg = Text::_('COM_J2COMMERCE_CART_UPDATED_SUCCESSFULLY');
         } else {
-            $msg = $model->getError();
+            $msg = Text::_('COM_J2COMMERCE_CART_DELETE_ERROR');
         }
 
         $url = $model->getCartUrl();
@@ -1064,6 +1068,12 @@ class CartsController extends BaseController
             }
 
             if (!$couponModel->isValid($orderContext)) {
+                // Safe to carry: isValid() relays a CouponRejection as given and collapses
+                // every other throwable to a generic string. Only this component throws that
+                // type, so nothing the query, date or plugin layers wrote can arrive here —
+                // a subscriber raising \DomainException lands in the second arm. The enqueued
+                // copy does not arrive at all — the queue is persisted in redirect() alone,
+                // and this path closes instead.
                 $this->sendJsonResponse([
                     'success' => false,
                     'message' => $couponModel->getError() ?: Text::_('COM_J2COMMERCE_COUPON_NOT_VALID'),
@@ -1156,6 +1166,12 @@ class CartsController extends BaseController
             $voucherModel->voucher = $voucherModel->getVoucherByCode($voucher);
 
             if (!$voucherModel->isValid()) {
+                // Safe to carry: isValid() relays a VoucherRejection as given and collapses
+                // every other throwable to a generic string. Only this component throws that
+                // type, so nothing the query, date or plugin layers wrote can arrive here —
+                // a subscriber raising \DomainException lands in the second arm. The enqueued copy
+                // does not arrive at all — the queue is persisted in redirect()
+                // alone, and this path closes instead.
                 $this->sendJsonResponse([
                     'success' => false,
                     'message' => $voucherModel->getError() ?: Text::_('COM_J2COMMERCE_VOUCHER_NOT_VALID'),
@@ -1258,7 +1274,7 @@ class CartsController extends BaseController
             $json['error']['zone_id'] = Text::_('COM_J2COMMERCE_ESTIMATE_ZONE_REQUIRED');
         }
 
-        if (($postalRequired || $params->get('postalcode_required', 0)) && empty($postcode)) {
+        if (($postalRequired || $params->get('postalcode_required', 1)) && empty($postcode)) {
             $json['error']['postcode'] = Text::_('COM_J2COMMERCE_ESTIMATE_POSTALCODE_REQUIRED');
         }
 
@@ -1345,7 +1361,7 @@ class CartsController extends BaseController
             $json['error']['zone_id'] = Text::_('COM_J2COMMERCE_ESTIMATE_ZONE_REQUIRED');
         }
 
-        if (($postalRequired || $params->get('postalcode_required', 0)) && empty($postcode)) {
+        if (($postalRequired || $params->get('postalcode_required', 1)) && empty($postcode)) {
             $json['error']['postcode'] = Text::_('COM_J2COMMERCE_ESTIMATE_POSTALCODE_REQUIRED');
         }
 
@@ -1387,6 +1403,7 @@ class CartsController extends BaseController
                 $methods = J2CommerceHelper::plugin()->eventWithArray('GetShippingRates', [$order]);
 
                 $methods = CartOrder::sortShippingRates($methods, ConfigHelper::autoApplyShippingRate());
+                $methods = array_values(array_filter($methods, [CartOrder::class, 'rateChargesAreValid']));
 
                 $session->set('shipping_methods', $methods, 'j2commerce');
 
@@ -1401,6 +1418,7 @@ class CartsController extends BaseController
                         'shipping_extra'        => $first['extra'],
                         'shipping_code'         => $first['code'],
                         'shipping_plugin'       => $first['element'],
+                        'shipping_tax_resolved' => CartOrder::rateTaxIsResolved($first),
                     ], 'j2commerce');
                 } else {
                     $session->clear('shipping_methods', 'j2commerce');
@@ -1455,7 +1473,7 @@ class CartsController extends BaseController
         $model   = $this->getCartModel();
         $session = $this->app->getSession();
 
-        // Rates are resolved server-side from the identifier; an unmatched selection leaves session values as they are.
+        // Rates are resolved server-side from the identifier; an unmatched selection is rejected, not silently kept.
         $selectedPlugin = $this->input->getString('shipping_plugin', '');
         $cartsModel     = $this->getModel('Carts');
         $order          = $cartsModel ? $cartsModel->getOrder() : null;
@@ -1468,9 +1486,14 @@ class CartsController extends BaseController
             )
             : null;
 
-        if ($resolved !== null) {
-            $session->set('shipping_values', $resolved, 'j2commerce');
+        if ($selectedPlugin !== '' && $resolved === null) {
+            $json['success'] = false;
+            $json['message'] = Text::_('COM_J2COMMERCE_CHECKOUT_SELECT_A_SHIPPING_METHOD');
+
+            $this->sendJsonResponse($json);
         }
+
+        $session->set('shipping_values', $resolved ?? CartOrder::emptyShippingValues(), 'j2commerce');
 
         $redirect         = $model->getCartUrl();
         $json['redirect'] = $redirect;

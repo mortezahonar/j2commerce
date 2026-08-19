@@ -28,6 +28,9 @@ $wa = $this->getDocument()->getWebAssetManager();
 $wa->useScript('keepalive')
     ->useScript('form.validate');
 
+// Adopts the shortcode sidebar this view fetches. Deferred, so it has run before any fetch callback.
+$wa->registerAndUseScript('com_j2commerce.dom', 'media/com_j2commerce/js/site/j2commerce-dom.js', [], ['defer' => true]);
+
 $bodySource = $this->item->body_source ?? 'visual';
 $isVisual = ($bodySource === 'visual');
 $isEditor = ($bodySource === 'editor');
@@ -154,11 +157,9 @@ document.addEventListener("DOMContentLoaded", function() {
                 });
 
                 if (response.ok) {
-                    const html = await response.text();
-                    const doc = iframe.contentDocument || iframe.contentWindow.document;
-                    doc.open();
-                    doc.write(html);
-                    doc.close();
+                    // srcdoc, not document.write: the sandboxed frame has an opaque origin,
+                    // so its document is not reachable from here and script never runs in it.
+                    iframe.srcdoc = await response.text();
                 } else {
                     Joomla.renderMessages({error: [Joomla.Text._("COM_J2COMMERCE_EMAILTEMPLATE_PREVIEW_FAILED")]});
                 }
@@ -201,7 +202,6 @@ document.addEventListener("DOMContentLoaded", function() {
                 formData.append("body", body);
                 formData.append("subject", subject);
                 formData.append("custom_css", customCss);
-                formData.append("recipient", email);
                 formData.append("email_type", document.getElementById("jform_email_type")?.value || "transactional");
                 formData.append(token, "1");
 
@@ -290,7 +290,7 @@ document.addEventListener("DOMContentLoaded", function() {
                     // Update inline sidebar
                     const sidebarContent = document.querySelector("#shortcodes-sidebar-col .options-form > div[style]");
                     if (sidebarContent) {
-                        sidebarContent.innerHTML = json.html;
+                        J2CommerceDom.adopt(sidebarContent, json.html);
                         bindShortcodeButtons(sidebarContent);
                     }
 
@@ -497,7 +497,7 @@ $tmpl = $input->get('tmpl', '', 'cmd') === 'component' ? '&tmpl=component' : '';
                     </div>
                 </div>
                 <div id="email-preview-container" style="border: 1px solid var(--gjs-border, #dee2e6); border-radius: 0.375rem; background: var(--gjs-bg-primary, #f8f9fa); min-height: 400px;">
-                    <iframe id="email-preview-iframe" style="width: 100%; min-height: 600px; border: none; background: var(--gjs-bg-canvas, #fff);" sandbox="allow-same-origin allow-scripts"></iframe>
+                    <iframe id="email-preview-iframe" style="width: 100%; min-height: 600px; border: none; background: var(--gjs-bg-canvas, #fff);" sandbox=""></iframe>
                 </div>
             </div>
         </div>
@@ -513,7 +513,7 @@ $tmpl = $input->get('tmpl', '', 'cmd') === 'component' ? '&tmpl=component' : '';
                     <div class="modal-body p-3">
                         <div class="mb-3">
                             <label for="test-email-address" class="form-label"><?php echo Text::_('COM_J2COMMERCE_EMAILTEMPLATE_SEND_TO'); ?></label>
-                            <input type="email" class="form-control" id="test-email-address" value="<?php echo $this->escape(Factory::getApplication()->getIdentity()->email); ?>">
+                            <input type="email" class="form-control" id="test-email-address" readonly value="<?php echo $this->escape(Factory::getApplication()->getIdentity()->email); ?>">
                         </div>
                     </div>
                     <div class="modal-footer">

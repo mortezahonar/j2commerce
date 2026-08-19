@@ -14,6 +14,7 @@ namespace J2Commerce\Component\J2commerce\Site\Model;
 
 \defined('_JEXEC') or die;
 
+use J2Commerce\Component\J2commerce\Administrator\Helper\CartOrder;
 use J2Commerce\Component\J2commerce\Administrator\Helper\J2CommerceHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\OrderHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\UtilitiesHelper;
@@ -311,9 +312,19 @@ class CartsModel extends BaseDatabaseModel
      */
     public function validateShippingSelection(): void
     {
-        $session         = Factory::getApplication()->getSession();
-        $shippingMethods = $session->get('shipping_methods', [], 'j2commerce');
-        $shippingValues  = $session->get('shipping_values', [], 'j2commerce');
+        $session = Factory::getApplication()->getSession();
+        $stored  = $session->get('shipping_methods', [], 'j2commerce');
+        $stored  = \is_array($stored) ? $stored : [];
+
+        // This model consumes whatever another path stored, so the offer list is filtered on
+        // read as well as on write — and written back, so the template loops the same list.
+        $shippingMethods = array_values(array_filter($stored, [CartOrder::class, 'rateChargesAreValid']));
+
+        if (\count($shippingMethods) !== \count($stored)) {
+            $session->set('shipping_methods', $shippingMethods, 'j2commerce');
+        }
+
+        $shippingValues = $session->get('shipping_values', [], 'j2commerce');
 
         // Nothing selected -- nothing to validate
         if (empty($shippingValues)) {
@@ -355,6 +366,7 @@ class CartsModel extends BaseDatabaseModel
             'shipping_extra'        => $default['extra'],
             'shipping_code'         => $default['code'],
             'shipping_plugin'       => $default['element'],
+            'shipping_tax_resolved' => CartOrder::rateTaxIsResolved($default),
         ], 'j2commerce');
     }
 }

@@ -44,6 +44,7 @@ class InventoryModel extends ListModel
                 'manage_stock', 'v.manage_stock',
                 'availability', 'v.availability',
                 'product_type', 'p.product_type',
+                'state', 'a.state',
             ];
         }
 
@@ -75,6 +76,9 @@ class InventoryModel extends ListModel
         $product_type = $this->getUserStateFromRequest($this->context . '.filter.product_type', 'filter_product_type', '');
         $this->setState('filter.product_type', $product_type);
 
+        $state = $this->getUserStateFromRequest($this->context . '.filter.state', 'filter_state', '', 'string');
+        $this->setState('filter.state', $state);
+
         // List state information.
         parent::populateState($ordering, $direction);
     }
@@ -95,6 +99,7 @@ class InventoryModel extends ListModel
         $id .= ':' . $this->getState('filter.manage_stock');
         $id .= ':' . $this->getState('filter.availability');
         $id .= ':' . $this->getState('filter.product_type');
+        $id .= ':' . $this->getState('filter.state');
 
         return parent::getStoreId($id);
     }
@@ -121,6 +126,7 @@ class InventoryModel extends ListModel
                 'p.product_type, ' .
                 'p.has_options, ' .
                 'a.title as product_name, ' .
+                'a.state as article_state, ' .
                 'pq.quantity, ' .
                 'pq.on_hold, ' .
                 'pq.sold, ' .
@@ -136,14 +142,13 @@ class InventoryModel extends ListModel
         // From j2commerce_products table
         $query->from($db->quoteName('#__j2commerce_products', 'p'));
 
-        // Join with variants table to get the master variant
-        $query->join('LEFT', $db->quoteName('#__j2commerce_variants', 'v') . ' ON (' .
-            $db->quoteName('v.product_id') . ' = ' . $db->quoteName('p.j2commerce_product_id') .
-            ' AND ' . $db->quoteName('v.is_master') . ' = 1)');
+        // Join with variants table, resolved to exactly one variant per product
+        $query->join('LEFT', $db->quoteName('#__j2commerce_variants', 'v') . ' ON ' .
+            $db->quoteName('v.j2commerce_variant_id') . ' = (' . $this->getSingleVariantSubQuery() . ')');
 
-        // Join with productquantities table
-        $query->join('LEFT', $db->quoteName('#__j2commerce_productquantities', 'pq') . ' ON (' .
-            $db->quoteName('pq.variant_id') . ' = ' . $db->quoteName('v.j2commerce_variant_id') . ')');
+        // Join with productquantities table, resolved to one row per variant
+        $query->join('LEFT', $db->quoteName('#__j2commerce_productquantities', 'pq') . ' ON ' .
+            $db->quoteName('pq.j2commerce_productquantity_id') . ' = (' . $this->getSingleQuantitySubQuery() . ')');
 
         // Join with content table to get product names
         $query->join('LEFT', $db->quoteName('#__content', 'a') . ' ON (' .
@@ -189,6 +194,14 @@ class InventoryModel extends ListModel
                 ->bind(':productType', $productType, ParameterType::STRING);
         }
 
+        // Filter by the article state shown in the Status column
+        $state = $this->getState('filter.state');
+        if (is_numeric($state)) {
+            $stateInt = (int) $state;
+            $query->where($db->quoteName('a.state') . ' = :state')
+                ->bind(':state', $stateInt, ParameterType::INTEGER);
+        }
+
         // Only show products that have content articles
         $query->where($db->quoteName('a.title') . ' IS NOT NULL');
 
@@ -201,6 +214,32 @@ class InventoryModel extends ListModel
         }
 
         return $query;
+    }
+
+    /** Lowest master variant of `p`, else its lowest variant — no key holds a product to one master. */
+    private function getSingleVariantSubQuery(): string
+    {
+        $db = $this->getDatabase();
+
+        return (string) $db->getQuery(true)
+            ->select(
+                'COALESCE(MIN(CASE WHEN ' . $db->quoteName('vm.is_master') . ' = 1 THEN '
+                . $db->quoteName('vm.j2commerce_variant_id') . ' END), MIN('
+                . $db->quoteName('vm.j2commerce_variant_id') . '))'
+            )
+            ->from($db->quoteName('#__j2commerce_variants', 'vm'))
+            ->where($db->quoteName('vm.product_id') . ' = ' . $db->quoteName('p.j2commerce_product_id'));
+    }
+
+    /** Lowest quantity row of `v` — current installs hold UNIQUE(variant_id), J2Store-era tables need not. */
+    private function getSingleQuantitySubQuery(): string
+    {
+        $db = $this->getDatabase();
+
+        return (string) $db->getQuery(true)
+            ->select('MIN(' . $db->quoteName('pqm.j2commerce_productquantity_id') . ')')
+            ->from($db->quoteName('#__j2commerce_productquantities', 'pqm'))
+            ->where($db->quoteName('pqm.variant_id') . ' = ' . $db->quoteName('v.j2commerce_variant_id'));
     }
 
     /**
@@ -230,11 +269,10 @@ class InventoryModel extends ListModel
                 $item->manage_stock = $item->manage_stock ?? 0;
                 $item->has_options  = $item->has_options ?? 0;
 
-                // Reflect the shopper-facing stock status, not the raw column.
-                // Storefront rule (ProductHelper::validateVariableProduct): when stock
-                // is not managed the item is always sellable; when managed it is in
-                // stock only if availability is set or backorders are allowed.
-                $item->availability = $this->resolveStockStatus($item);
+                // Render the stored column, not a derived value: the Stock Status select in
+                // this row posts straight back to v.availability, so anything else here
+                // overwrites the owner's saved choice on every reload.
+                $item->availability = $item->availability ?? 1;
 
                 // Add SKU field to item if not present
                 if (!isset($item->sku)) {
@@ -252,31 +290,6 @@ class InventoryModel extends ListModel
         }
 
         return $items;
-    }
-
-    /**
-     * Resolve the shopper-facing stock status for the inventory select.
-     *
-     * Mirrors the storefront rule (ProductHelper::validateVariableProduct):
-     * unmanaged stock is always in stock; managed stock is in stock only when
-     * availability is set or backorders are allowed.
-     *
-     * @param   object  $row  Product/variant row with manage_stock, availability, allow_backorder.
-     *
-     * @return  int  1 = in stock, 0 = out of stock.
-     *
-     * @since   6.0.0
-     */
-    private function resolveStockStatus(object $row): int
-    {
-        if ((int) ($row->manage_stock ?? 0) !== 1) {
-            return 1;
-        }
-
-        $available = !empty($row->availability);
-        $backorder = (int) ($row->allow_backorder ?? 0) >= 1;
-
-        return ($available || $backorder) ? 1 : 0;
     }
 
     /**
@@ -633,11 +646,10 @@ class InventoryModel extends ListModel
         ]);
 
         $query->from($db->quoteName('#__j2commerce_products', 'p'))
-            ->join('LEFT', $db->quoteName('#__j2commerce_variants', 'v') . ' ON (' .
-                $db->quoteName('v.product_id') . ' = ' . $db->quoteName('p.j2commerce_product_id') .
-                ' AND ' . $db->quoteName('v.is_master') . ' = 1)')
-            ->join('LEFT', $db->quoteName('#__j2commerce_productquantities', 'pq') . ' ON (' .
-                $db->quoteName('pq.variant_id') . ' = ' . $db->quoteName('v.j2commerce_variant_id') . ')')
+            ->join('LEFT', $db->quoteName('#__j2commerce_variants', 'v') . ' ON ' .
+                $db->quoteName('v.j2commerce_variant_id') . ' = (' . $this->getSingleVariantSubQuery() . ')')
+            ->join('LEFT', $db->quoteName('#__j2commerce_productquantities', 'pq') . ' ON ' .
+                $db->quoteName('pq.j2commerce_productquantity_id') . ' = (' . $this->getSingleQuantitySubQuery() . ')')
             ->join('LEFT', $db->quoteName('#__content', 'a') . ' ON (' .
                 $db->quoteName('a.id') . ' = ' . $db->quoteName('p.product_source_id') . ')');
 
@@ -788,7 +800,7 @@ class InventoryModel extends ListModel
                     $variant->manage_stock = $variant->manage_stock ?? 0;
                     $variant->on_hold      = $variant->on_hold ?? 0;
                     $variant->sold         = $variant->sold ?? 0;
-                    $variant->availability = $this->resolveStockStatus($variant);
+                    $variant->availability = $variant->availability ?? 1;
                 }
             }
 

@@ -23,6 +23,7 @@ use Joomla\CMS\Factory;
 use Joomla\CMS\Form\Form;
 use Joomla\CMS\Language\Text;
 use Joomla\CMS\Layout\FileLayout;
+use Joomla\CMS\Log\Log;
 use Joomla\CMS\MVC\Controller\AdminController;
 use Joomla\CMS\MVC\Factory\MVCFactoryInterface;
 use Joomla\CMS\Router\Route;
@@ -170,7 +171,8 @@ class ProductsController extends AdminController
 
             // Delete the product (cascades child records via ProductTable::delete)
             if (!$table->delete($productId)) {
-                $this->app->enqueueMessage($table->getError(), 'error');
+                Log::add('products.delete failed: ' . $table->getError(), Log::ERROR, 'com_j2commerce');
+                $this->app->enqueueMessage(Text::_('COM_J2COMMERCE_ERR_GENERIC'), 'error');
                 $errors++;
                 continue;
             }
@@ -203,8 +205,9 @@ class ProductsController extends AdminController
                         throw new \RuntimeException($articleModel->getError());
                     }
                 } catch (\Exception $e) {
+                    Log::add('products.deleteWithArticles failed: ' . $e->getMessage(), Log::ERROR, 'com_j2commerce');
                     $this->app->enqueueMessage(
-                        Text::sprintf('COM_J2COMMERCE_ERROR_TRASH_ARTICLE', $articleId, $e->getMessage()),
+                        Text::sprintf('COM_J2COMMERCE_ERROR_TRASH_ARTICLE', $articleId, Text::_('COM_J2COMMERCE_ERR_GENERIC')),
                         'warning'
                     );
                 }
@@ -331,7 +334,8 @@ class ProductsController extends AdminController
                     $msg     = Text::_('COM_J2COMMERCE_PRODUCT_FILTER_DELETE_SUCCESSFUL');
                 }
             } catch (\Exception $e) {
-                $msg = $e->getMessage();
+                Log::add('products.deleteproductfilter failed: ' . $e->getMessage(), Log::ERROR, 'com_j2commerce');
+                $msg = Text::_('COM_J2COMMERCE_ERR_GENERIC');
             }
         }
 
@@ -736,7 +740,8 @@ class ProductsController extends AdminController
                             $this->setMessage(Text::plural($ntext, \count($cid)));
                         }
                     } catch (\Exception $e) {
-                        $this->setMessage($e->getMessage(), 'error');
+                        Log::add('products.publish failed: ' . $e->getMessage(), Log::ERROR, 'com_j2commerce');
+                        $this->setMessage(Text::_('COM_J2COMMERCE_ERR_GENERIC'), 'error');
                     }
                 } else {
                     $this->app->enqueueMessage(Text::_('JLIB_APPLICATION_ERROR_EDITSTATE_NOT_PERMITTED'), CMSWebApplicationInterface::MSG_ERROR);
@@ -1367,7 +1372,8 @@ class ProductsController extends AdminController
             $msg     = Text::_('COM_J2COMMERCE_PRODUCT_OPTION_VALUE_CREATED');
             $msgType = 'message';
         } catch (\Exception $e) {
-            $msg     = $e->getMessage();
+            Log::add('products.createproductoptionvalue failed: ' . $e->getMessage(), Log::ERROR, 'com_j2commerce');
+            $msg     = Text::_('COM_J2COMMERCE_ERR_GENERIC');
             $msgType = 'error';
         }
 
@@ -1493,7 +1499,8 @@ class ProductsController extends AdminController
                 $msg     = Text::plural('COM_J2COMMERCE_N_ITEMS_DELETED', \count($cid));
                 $msgType = 'message';
             } catch (\Exception $e) {
-                $msg     = $e->getMessage();
+                Log::add('products.deleteProductOptionvalues failed: ' . $e->getMessage(), Log::ERROR, 'com_j2commerce');
+                $msg     = Text::_('COM_J2COMMERCE_ERR_GENERIC');
                 $msgType = 'error';
             }
         } else {
@@ -1859,7 +1866,8 @@ class ProductsController extends AdminController
             $response['success'] = true;
             $response['message'] = Text::_('COM_J2COMMERCE_PRODUCT_OPTION_VALUE_CREATED');
         } catch (\Exception $e) {
-            $response['message'] = $e->getMessage();
+            Log::add('products.createProductOptionValueAjax failed: ' . $e->getMessage(), Log::ERROR, 'com_j2commerce');
+            $response['message'] = Text::_('COM_J2COMMERCE_ERR_GENERIC');
         }
 
         echo json_encode($response);
@@ -1939,7 +1947,8 @@ class ProductsController extends AdminController
             $response['success'] = true;
             $response['message'] = Text::_('COM_J2COMMERCE_PRODUCT_OPTION_VALUES_SAVED');
         } catch (\Exception $e) {
-            $response['message'] = $e->getMessage();
+            Log::add('products.saveProductOptionValueAjax failed: ' . $e->getMessage(), Log::ERROR, 'com_j2commerce');
+            $response['message'] = Text::_('COM_J2COMMERCE_ERR_GENERIC');
         }
 
         echo json_encode($response);
@@ -1983,7 +1992,8 @@ class ProductsController extends AdminController
                 $response['success'] = true;
                 $response['message'] = Text::plural('COM_J2COMMERCE_N_ITEMS_DELETED', 1);
             } catch (\Exception $e) {
-                $response['message'] = $e->getMessage();
+                Log::add('products.deleteProductOptionValueAjax failed: ' . $e->getMessage(), Log::ERROR, 'com_j2commerce');
+                $response['message'] = Text::_('COM_J2COMMERCE_ERR_GENERIC');
             }
         } else {
             $response['message'] = Text::_('COM_J2COMMERCE_NO_ITEM_SELECTED');
@@ -1993,13 +2003,7 @@ class ProductsController extends AdminController
         $app->close();
     }
 
-    /**
-     * Set default product option value.
-     *
-     * @return  void
-     *
-     * @since   6.0.3
-     */
+    /** Clear (via the unsetDefault task) or pin one option value as the option's default. */
     public function setDefault(): void
     {
         $this->checkToken('request');
@@ -2020,8 +2024,26 @@ class ProductsController extends AdminController
         $cid   = ArrayHelper::toInteger($cid);
         $povId = !empty($cid) ? (int) $cid[0] : 0;
 
-        if ($povId && $productOptionId) {
-            // Reset all defaults for this product option
+        // getTask() reports the task in the casing the request used, so settle on one.
+        $value = strtolower((string) $this->getTask()) === 'unsetdefault' ? 0 : 1;
+
+        // Resolves the option only where the product named alongside it holds that
+        // option, so a pairing the product does not have decides nothing here.
+        $productOption = ProductHelper::getCartProductOptions($productOptionId, $productId);
+
+        if (!$povId || !$productOption) {
+            echo json_encode(['success' => false]);
+            $app->close();
+
+            return;
+        }
+
+        $isMultiSelect = ($productOption->type ?? '') === 'checkbox';
+
+        // A single-choice control can only carry one default, so pinning one value
+        // releases its siblings. A checkbox option submits every value it holds, so
+        // its defaults stand alongside each other.
+        if ($value === 1 && !$isMultiSelect) {
             $query = $db->getQuery(true);
             $query->update($db->quoteName('#__j2commerce_product_optionvalues'))
                 ->set($db->quoteName('product_optionvalue_default') . ' = 0')
@@ -2030,20 +2052,25 @@ class ProductsController extends AdminController
 
             $db->setQuery($query);
             $db->execute();
-
-            // Set the selected one as default
-            $query = $db->getQuery(true);
-            $query->update($db->quoteName('#__j2commerce_product_optionvalues'))
-                ->set($db->quoteName('product_optionvalue_default') . ' = 1')
-                ->where($db->quoteName('j2commerce_product_optionvalue_id') . ' = :povId')
-                ->bind(':povId', $povId, ParameterType::INTEGER);
-
-            $db->setQuery($query);
-            $db->execute();
         }
 
-        echo json_encode(['success' => true]);
+        $query = $db->getQuery(true);
+        $query->update($db->quoteName('#__j2commerce_product_optionvalues'))
+            ->set($db->quoteName('product_optionvalue_default') . ' = :value')
+            ->where($db->quoteName('j2commerce_product_optionvalue_id') . ' = :povId')
+            ->bind(':value', $value, ParameterType::INTEGER)
+            ->bind(':povId', $povId, ParameterType::INTEGER);
+
+        $db->setQuery($query);
+        $db->execute();
+
+        echo json_encode(['success' => true, 'is_default' => $value, 'exclusive' => !$isMultiSelect]);
         $app->close();
+    }
+
+    public function unsetDefault(): void
+    {
+        $this->setDefault();
     }
 
     /**
@@ -2214,7 +2241,7 @@ class ProductsController extends AdminController
                 // Create product variant optionvalues mapping
                 $productVariantOptionValue                          = new \stdClass();
                 $productVariantOptionValue->variant_id              = $variantId;
-                $productVariantOptionValue->product_optionvalue_ids = implode(',', $productOptionvalueIds);
+                $productVariantOptionValue->product_optionvalue_ids = ProductHelper::normaliseOptionvalueKey($productOptionvalueIds);
 
                 $db->insertObject('#__j2commerce_product_variant_optionvalues', $productVariantOptionValue);
 
@@ -2237,7 +2264,8 @@ class ProductsController extends AdminController
                 $response['total']      = $total;
             }
         } catch (\Exception $e) {
-            $response['message'] = $e->getMessage();
+            Log::add('products.addVariantAjax failed: ' . $e->getMessage(), Log::ERROR, 'com_j2commerce');
+            $response['message'] = Text::_('COM_J2COMMERCE_ERR_GENERIC');
         }
 
         echo json_encode($response);
@@ -2528,9 +2556,7 @@ class ProductsController extends AdminController
         // Normalize existing CSVs for comparison
         $existingNormalized = [];
         foreach ($existingCsvs as $csv) {
-            $ids = explode(',', $csv);
-            sort($ids);
-            $existingNormalized[] = implode(',', $ids);
+            $existingNormalized[] = ProductHelper::normaliseOptionvalueKey($csv);
         }
 
         // Check if any existing variant is already set as default
@@ -2564,14 +2590,11 @@ class ProductsController extends AdminController
             }
 
             // Skip combinations with missing/invalid option value IDs
-            $povIds = array_filter($povIds, static fn (int $id): bool => $id > 0);
+            $povIdsCsv = ProductHelper::normaliseOptionvalueKey($povIds);
 
-            if (empty($povIds)) {
+            if ($povIdsCsv === '') {
                 continue;
             }
-
-            sort($povIds);
-            $povIdsCsv = implode(',', $povIds);
 
             // Check for existing variant with same option combination
             if (\in_array($povIdsCsv, $existingNormalized, true)) {
@@ -2777,14 +2800,12 @@ class ProductsController extends AdminController
             }
 
             // Skip combinations with missing/invalid option value IDs
-            $povIds = array_filter($povIds, static fn (int $id): bool => $id > 0);
+            $povIdsCsv = ProductHelper::normaliseOptionvalueKey($povIds);
 
-            if (empty($povIds)) {
+            if ($povIdsCsv === '') {
                 continue;
             }
 
-            sort($povIds);
-            $povIdsCsv  = implode(',', $povIds);
             $variantSku = $baseSku . (!empty($skuParts) ? '-' . implode('-', $skuParts) : '-V' . ($createdCount + 1));
 
             $variantData = (object) [
@@ -2865,7 +2886,15 @@ class ProductsController extends AdminController
         $app = Factory::getApplication();
         $db  = Factory::getContainer()->get('DatabaseDriver');
 
-        // Requires core.edit; the denial is shaped like an empty page so the caller's `if (data.html)` is a no-op.
+        // Both denials are shaped like an empty page so the caller's `if (data.html)` is a no-op.
+        if (!\Joomla\CMS\Session\Session::checkToken('request')) {
+            echo json_encode(['html' => '', 'total' => 0, 'message' => Text::_('JINVALID_TOKEN')]);
+            $app->close();
+
+            return;
+        }
+
+        // Requires core.edit, like the three sibling variant tasks.
         if (!$this->canDo('core.edit')) {
             echo json_encode(['html' => '', 'total' => 0, 'message' => Text::_('JLIB_APPLICATION_ERROR_ACCESS_FORBIDDEN')]);
             $app->close();
@@ -3178,7 +3207,8 @@ class ProductsController extends AdminController
             $response['message']    = Text::_('COM_J2COMMERCE_VARIANT_SET_DEFAULT_SUCCESS');
             $response['variant_id'] = $variantId;
         } catch (\Exception $e) {
-            $response['message'] = $e->getMessage();
+            Log::add('products.setDefaultVariantAjax failed: ' . $e->getMessage(), Log::ERROR, 'com_j2commerce');
+            $response['message'] = Text::_('COM_J2COMMERCE_ERR_GENERIC');
         }
 
         echo json_encode($response);
@@ -3243,7 +3273,8 @@ class ProductsController extends AdminController
             $response['message']    = Text::_('COM_J2COMMERCE_VARIANT_UNSET_DEFAULT_SUCCESS');
             $response['variant_id'] = $variantId;
         } catch (\Exception $e) {
-            $response['message'] = $e->getMessage();
+            Log::add('products.unsetDefaultVariantAjax failed: ' . $e->getMessage(), Log::ERROR, 'com_j2commerce');
+            $response['message'] = Text::_('COM_J2COMMERCE_ERR_GENERIC');
         }
 
         echo json_encode($response);
@@ -3307,7 +3338,8 @@ class ProductsController extends AdminController
 
             return true;
         } catch (\Exception $e) {
-            Factory::getApplication()->enqueueMessage($e->getMessage(), 'error');
+            Log::add('products.deleteSingleVariant failed: ' . $e->getMessage(), Log::ERROR, 'com_j2commerce');
+            Factory::getApplication()->enqueueMessage(Text::_('COM_J2COMMERCE_ERR_GENERIC'), 'error');
             return false;
         }
     }
@@ -3499,7 +3531,8 @@ class ProductsController extends AdminController
         try {
             $poTable->store();
         } catch (\Throwable $e) {
-            $response['message'] = $e->getMessage();
+            Log::add('products.addProductOptionAjax failed: ' . $e->getMessage(), Log::ERROR, 'com_j2commerce');
+            $response['message'] = Text::_('COM_J2COMMERCE_ERR_GENERIC');
             echo json_encode($response);
             $app->close();
             return;
@@ -3579,7 +3612,8 @@ class ProductsController extends AdminController
             $db->transactionCommit();
         } catch (\Throwable $e) {
             $db->transactionRollback();
-            $response['message'] = $e->getMessage();
+            Log::add('products.removeProductOptionAjax failed: ' . $e->getMessage(), Log::ERROR, 'com_j2commerce');
+            $response['message'] = Text::_('COM_J2COMMERCE_ERR_GENERIC');
             echo json_encode($response);
             $app->close();
             return;
@@ -3673,7 +3707,8 @@ class ProductsController extends AdminController
             $db->transactionCommit();
         } catch (\Throwable $e) {
             $db->transactionRollback();
-            $response['message'] = $e->getMessage();
+            Log::add('products.saveProductOptionsAjax failed: ' . $e->getMessage(), Log::ERROR, 'com_j2commerce');
+            $response['message'] = Text::_('COM_J2COMMERCE_ERR_GENERIC');
             echo json_encode($response);
             $app->close();
             return;

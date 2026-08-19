@@ -389,6 +389,7 @@ class Downloadable
         $existingIds = array_map('intval', $db->loadColumn() ?: []);
 
         $submittedIds = [];
+        $storedPaths  = [];
 
         foreach ($files as $fileData) {
             $fileData    = (array) $fileData;
@@ -418,6 +419,8 @@ class Downloadable
 
                     continue;
                 }
+
+                $storedPaths[] = $path;
             }
 
             if (empty($displayName)) {
@@ -454,15 +457,26 @@ class Downloadable
         }
 
         // Delete files that were removed from the form
-        $toDelete = array_diff($existingIds, $submittedIds);
+        $toDelete     = array_diff($existingIds, $submittedIds);
+        $removedPaths = [];
 
         foreach ($toDelete as $deleteId) {
             $fileTable = $this->mvcFactory->createTable('Productfile', 'Administrator');
 
             if ($fileTable->load($deleteId)) {
+                $removedPaths[] = (string) $fileTable->product_file_save_name;
                 $fileTable->delete($deleteId);
             }
         }
+
+        // Last, so the rules are built from what the product ended up with: an allowed root
+        // is not the same as a protected one, and a download routinely shares a directory
+        // with the storefront's own images. Named files are denied there, nothing else is.
+        DownloadHelper::protectStoredFiles($storedPaths);
+
+        // The directories the removed rows leave behind are not in the set above, so their
+        // rules would keep naming a file this product no longer stores.
+        DownloadHelper::releaseStoredFiles($removedPaths);
     }
 
     /**

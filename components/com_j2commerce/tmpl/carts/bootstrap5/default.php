@@ -28,8 +28,12 @@ $document = $app->getDocument();
 $wa = $document->getWebAssetManager();
 $wa->useScript('bootstrap.collapse');
 
+// Safe DOM construction helpers for this template's inline JS, the calculator sub-template
+// and cart-ajax.js.
+$wa->registerAndUseScript('com_j2commerce.dom', 'media/com_j2commerce/js/site/j2commerce-dom.js', [], ['defer' => true]);
+
 // Load cart AJAX script using registerAndUseScript
-$wa->registerAndUseScript('com_j2commerce.cart-ajax', 'media/com_j2commerce/js/site/cart-ajax.js', [], ['defer' => true], ['core']);
+$wa->registerAndUseScript('com_j2commerce.cart-ajax', 'media/com_j2commerce/js/site/cart-ajax.js', [], ['defer' => true], ['core', 'com_j2commerce.dom']);
 
 // Pass configuration to JavaScript
 $document->addScriptOptions('j2commerce.cart', [
@@ -192,17 +196,14 @@ $clearCartUrl = J2CommerceHelper::platform()->getCartUrl(['task' => 'clearCart']
             .then(function(data) {
                 if (data.success && data.html) {
                     var totals = document.querySelector('.cart-totals-block');
-                    if (totals) totals.outerHTML = data.html;
+                    if (totals) totals.replaceWith(J2CommerceDom.parse(data.html));
                 }
                 if (data.shipping_html !== undefined) {
                     var shipping = document.getElementById('j2commerce-cart-shipping-wrapper');
-                    if (shipping) shipping.innerHTML = data.shipping_html;
+                    J2CommerceDom.adopt(shipping, data.shipping_html);
                 }
             })
             .catch(function() { window.location.reload(); });
-
-        // Also update the mini-cart module
-        document.dispatchEvent(new CustomEvent('j2commerce:cart:updated', { bubbles: true }));
     }
 
     document.addEventListener('j2commerce:coupon:applied', refreshCartTotals);

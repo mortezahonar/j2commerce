@@ -155,7 +155,8 @@ class EmailtemplatesController extends AdminController
             if ($model->delete($cid)) {
                 $this->setMessage(Text::plural($this->text_prefix . '_N_ITEMS_DELETED', \count($cid)));
             } else {
-                $this->setMessage($model->getError(), 'error');
+                Log::add('emailtemplates.delete failed: ' . $model->getError(), Log::ERROR, 'com_j2commerce');
+                $this->setMessage(Text::_('COM_J2COMMERCE_ERR_GENERIC'), 'error');
             }
 
             // Invoke the postDelete method to allow for the child class to access the model.
@@ -218,7 +219,8 @@ class EmailtemplatesController extends AdminController
 
         if ($return === false) {
             // Checkin failed.
-            $message = Text::sprintf('JLIB_APPLICATION_ERROR_CHECKIN_FAILED', $model->getError());
+            Log::add('emailtemplates.checkin failed: ' . $model->getError(), Log::ERROR, 'com_j2commerce');
+            $message = Text::sprintf('JLIB_APPLICATION_ERROR_CHECKIN_FAILED', Text::_('COM_J2COMMERCE_ERR_GENERIC'));
             $this->setRedirect(Route::_('index.php?option=' . $this->option . '&view=' . $this->view_list, false), $message, 'error');
 
             return false;
@@ -284,7 +286,8 @@ class EmailtemplatesController extends AdminController
 
         if ($return === false) {
             // Reorder failed.
-            $message = Text::sprintf('JLIB_APPLICATION_ERROR_REORDER_FAILED', $model->getError());
+            Log::add('emailtemplates.reorder failed: ' . $model->getError(), Log::ERROR, 'com_j2commerce');
+            $message = Text::sprintf('JLIB_APPLICATION_ERROR_REORDER_FAILED', Text::_('COM_J2COMMERCE_ERR_GENERIC'));
             $this->setRedirect(Route::_('index.php?option=' . $this->option . '&view=' . $this->view_list, false), $message, 'error');
 
             return false;
@@ -458,11 +461,24 @@ class EmailtemplatesController extends AdminController
         $userId        = (int) $this->app->getIdentity()->id;
         $now           = Factory::getDate()->toSql();
 
+        // The edit form holds a file-based body source to core.admin; an import writes the same field
+        $canUseFileSource = $this->app->getIdentity()->authorise('core.admin');
+
         foreach ($data['templates'] as $template) {
             $row = new \stdClass();
             foreach ($allowedFields as $field) {
                 $row->$field = $template[$field] ?? '';
             }
+
+            // Clear on the privilege, not on the pairing — body_source has more than one file-ish value
+            if (!$canUseFileSource) {
+                $row->body_source_file = '';
+
+                if ($row->body_source === 'file') {
+                    $row->body_source = 'visual';
+                }
+            }
+
             $row->j2commerce_emailtemplate_id = 0;
             $row->created_on                  = $now;
             $row->created_by                  = $userId;

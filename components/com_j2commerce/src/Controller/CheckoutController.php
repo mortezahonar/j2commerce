@@ -48,8 +48,6 @@ use Joomla\Registry\Registry;
 
 class CheckoutController extends BaseController
 {
-    protected string $lastAddressError = '';
-
     public function display($cachable = false, $urlparams = []): static
     {
         UtilitiesHelper::sendNoCacheHeaders();
@@ -196,26 +194,56 @@ class CheckoutController extends BaseController
         $addressTable = $this->getMvcFactory()->createTable('Address', 'Administrator');
 
         if (!$addressTable) {
-            $this->lastAddressError = 'Could not create Address table instance.';
+            Log::add('checkout.saveAddress could not create the Address table instance.', Log::ERROR, 'com_j2commerce');
             return false;
         }
 
         if (!$addressTable->bind($addressData)) {
-            $this->lastAddressError = 'Bind failed: ' . $addressTable->getError();
+            Log::add('checkout.saveAddress bind failed: ' . $addressTable->getError(), Log::ERROR, 'com_j2commerce');
             return false;
         }
 
         if (!$addressTable->check()) {
-            $this->lastAddressError = 'Validation failed: ' . $addressTable->getError();
+            Log::add('checkout.saveAddress validation failed: ' . $addressTable->getError(), Log::ERROR, 'com_j2commerce');
             return false;
         }
 
         if (!$addressTable->store()) {
-            $this->lastAddressError = 'Store failed: ' . $addressTable->getError();
+            Log::add('checkout.saveAddress store failed: ' . $addressTable->getError(), Log::ERROR, 'com_j2commerce');
             return false;
         }
 
         return (int) $addressTable->j2commerce_address_id;
+    }
+
+    /**
+     * Decide what a failed User::save() is allowed to tell the shopper.
+     *
+     * Joomla funnels two unrelated things through User::getError(): the messages
+     * UserTable::check() raises, which name the field the shopper has to correct,
+     * and whatever the catch in User::save() picked up, which is the driver's own
+     * text. Only the first set is answerable by retyping, so only it travels back.
+     */
+    protected function shopperSafeUserError(string $error): string
+    {
+        $answerable = [
+            Text::_('JLIB_DATABASE_ERROR_PLEASE_ENTER_YOUR_NAME'),
+            Text::_('JLIB_DATABASE_ERROR_PLEASE_ENTER_A_USER_NAME'),
+            Text::sprintf('JLIB_DATABASE_ERROR_VALID_AZ09', 2),
+            Text::_('JLIB_DATABASE_ERROR_VALID_MAIL'),
+            Text::_('JLIB_DATABASE_ERROR_USERNAME_INUSE'),
+            Text::_('JLIB_DATABASE_ERROR_EMAIL_INUSE'),
+        ];
+
+        if ($error !== '' && \in_array($error, $answerable, true)) {
+            return $error;
+        }
+
+        if ($error !== '') {
+            Log::add('checkout.registerValidate user save failed: ' . $error, Log::ERROR, 'com_j2commerce');
+        }
+
+        return Text::_('COM_J2COMMERCE_CHECKOUT_REGISTER_ERROR');
     }
 
     /**
@@ -230,7 +258,9 @@ class CheckoutController extends BaseController
     }
 
     /**
-     * Set shipping session values from address data.
+     * Set shipping session values from address data. Rates are quoted against these, so the
+     * offer list and the selection made from it are dropped here rather than at each caller —
+     * a destination writer added later inherits the invalidation instead of having to know.
      */
     protected function setShippingSession(array $data): void
     {
@@ -238,6 +268,8 @@ class CheckoutController extends BaseController
         $session->set('shipping_country_id', (int) ($data['country_id'] ?? 0), 'j2commerce');
         $session->set('shipping_zone_id', (int) ($data['zone_id'] ?? 0), 'j2commerce');
         $session->set('shipping_postcode', $data['zip'] ?? '', 'j2commerce');
+
+        $this->clearShippingSelection();
     }
 
     // =========================================================================
@@ -324,7 +356,7 @@ class CheckoutController extends BaseController
                     $addressInfo = $this->getUserFirstAddress((int) $loggedUser->id);
 
                     if ($addressInfo) {
-                        $taxDefault = $params->get('config_tax_default', '');
+                        $taxDefault = $params->get('config_tax_default', 'billing');
 
                         if ($taxDefault === 'shipping') {
                             $session->set('shipping_country_id', (int) $addressInfo->country_id, 'j2commerce');
@@ -345,6 +377,10 @@ class CheckoutController extends BaseController
                         $session->clear('billing_zone_id', 'j2commerce');
                         $session->clear('billing_postcode', 'j2commerce');
                     }
+
+                    // Either arm moves where rates are quoted from, so anything quoted for
+                    // the pre-login destination goes with it.
+                    $this->clearShippingSelection();
                 }
 
                 $session->clear('guest', 'j2commerce');
@@ -493,7 +529,10 @@ class CheckoutController extends BaseController
             $user = new \Joomla\CMS\User\User();
 
             if (!$user->bind($userData)) {
-                $json['error']['warning'] = $user->getError() ?: Text::_('COM_J2COMMERCE_CHECKOUT_REGISTER_ERROR');
+                // A new user reaches none of bind()'s setError() calls — they all sit in
+                // the branch that updates an existing one — so there is nothing here to
+                // pass on. The password pair is settled above either way.
+                $json['error']['warning'] = Text::_('COM_J2COMMERCE_CHECKOUT_REGISTER_ERROR');
                 $this->jsonResponse($json);
 
                 return;
@@ -516,7 +555,7 @@ class CheckoutController extends BaseController
 
             try {
                 if (!$user->save()) {
-                    $json['error']['warning'] = $user->getError() ?: Text::_('COM_J2COMMERCE_CHECKOUT_REGISTER_ERROR');
+                    $json['error']['warning'] = $this->shopperSafeUserError((string) $user->getError());
                     $this->jsonResponse($json);
 
                     return;
@@ -575,14 +614,40 @@ class CheckoutController extends BaseController
 
             $this->setBillingSession($addressData);
 
-            // If shipping same as billing
+            // If shipping same as billing. The shopper is logged in with a saved
+            // row by this point, so mirror the id the way the billing step does —
+            // the order resolves a member's ship-to from `shipping_address_id`.
             if ($this->input->getInt('shipping_address', 0)) {
+                if ($newAddressId) {
+                    $session->set('shipping_address_id', $newAddressId, 'j2commerce');
+                }
+
                 $this->setShippingSession($addressData);
             }
 
             $session->clear('guest', 'j2commerce');
             $session->clear('payment_method', 'j2commerce');
             $session->clear('payment_methods', 'j2commerce');
+
+            if (!$newAddressId) {
+                // The billing step answers COM_J2COMMERCE_ADDRESS_SAVE_ERROR and stops, and
+                // stopping is right here too: the order reads its address from the saved row
+                // or from the guest keys cleared just above, so the country/zone/postcode
+                // copies setBillingSession() holds do not stand in for one.
+                //
+                // It cannot stop in place, though. The account exists and the shopper is
+                // logged in by this point, so the register form is no longer theirs to
+                // resubmit — it would only answer COM_J2COMMERCE_CHECKOUT_EMAIL_EXISTS, and
+                // the refreshed token below never reaches the page. Send them back into
+                // checkout as the logged-in shopper they now are, where the address step
+                // takes the address again.
+                $this->app->enqueueMessage(Text::_('COM_J2COMMERCE_ADDRESS_SAVE_ERROR'), 'warning');
+
+                $json['redirect'] = $this->getCheckoutUrl();
+                $this->jsonResponse($json);
+
+                return;
+            }
         } catch (\Throwable $e) {
             // Plugin-enforced registration rules (privacy consent, terms) are caught
             // as InvalidArgumentException above with their own translated message.
@@ -653,9 +718,15 @@ class CheckoutController extends BaseController
 
         $this->setBillingSession($addressData);
 
-        // If shipping same as billing
+        // If shipping same as billing. The order reads a guest's ship-to from
+        // `guest_shipping` and nowhere else, and the shipping step that normally
+        // writes it is skipped on this branch — so assert it here or the order
+        // persists an empty shipping address.
         if ($this->input->getInt('shipping_address', 0)) {
+            $session->set('guest_shipping', $addressData, 'j2commerce');
             $this->setShippingSession($addressData);
+        } else {
+            $session->clear('guest_shipping', 'j2commerce');
         }
 
         $session->clear('payment_method', 'j2commerce');
@@ -785,9 +856,7 @@ class CheckoutController extends BaseController
                 $session->set('billing_address_id', $newAddressId, 'j2commerce');
                 $this->setBillingSession($addressData);
             } else {
-                $errorDetail              = $this->lastAddressError ?? '';
-                $json['error']['warning'] = Text::_('COM_J2COMMERCE_ADDRESS_SAVE_ERROR')
-                    . ($errorDetail ? ' (' . $errorDetail . ')' : '');
+                $json['error']['warning'] = Text::_('COM_J2COMMERCE_ADDRESS_SAVE_ERROR');
                 $this->jsonResponse($json);
 
                 return;
@@ -808,6 +877,8 @@ class CheckoutController extends BaseController
             $session->set('shipping_country_id', $session->get('billing_country_id', 0, 'j2commerce'), 'j2commerce');
             $session->set('shipping_zone_id', $session->get('billing_zone_id', 0, 'j2commerce'), 'j2commerce');
             $session->set('shipping_postcode', $session->get('billing_postcode', '', 'j2commerce'), 'j2commerce');
+
+            $this->clearShippingSelection();
         }
 
         J2CommerceHelper::plugin()->event('CheckoutValidateBilling', [&$json]);
@@ -913,8 +984,7 @@ class CheckoutController extends BaseController
             $session->set('shipping_zone_id', (int) ($addressTable->zone_id ?? 0), 'j2commerce');
             $session->set('shipping_postcode', $addressTable->zip ?? '', 'j2commerce');
 
-            $session->clear('shipping_method', 'j2commerce');
-            $session->clear('shipping_methods', 'j2commerce');
+            $this->clearShippingSelection();
         } else {
             $formData = $this->collectFormData();
             $fields   = CustomFieldHelper::getFieldsByArea('shipping');
@@ -938,13 +1008,16 @@ class CheckoutController extends BaseController
 
             $newAddressId = $this->saveAddress($addressData);
 
-            if ($newAddressId) {
-                $session->set('shipping_address_id', $newAddressId, 'j2commerce');
+            if (!$newAddressId) {
+                $json['error']['warning'] = Text::_('COM_J2COMMERCE_ADDRESS_SAVE_ERROR');
+                $this->jsonResponse($json);
+
+                return;
             }
 
+            $session->set('shipping_address_id', $newAddressId, 'j2commerce');
+
             $this->setShippingSession($addressData);
-            $session->clear('shipping_method', 'j2commerce');
-            $session->clear('shipping_methods', 'j2commerce');
         }
 
         J2CommerceHelper::plugin()->event('BeforeCheckoutValidateShipping', [&$json]);
@@ -986,8 +1059,6 @@ class CheckoutController extends BaseController
         $session->set('guest_shipping', $addressData, 'j2commerce');
 
         $this->setShippingSession($addressData);
-        $session->clear('shipping_method', 'j2commerce');
-        $session->clear('shipping_methods', 'j2commerce');
 
         J2CommerceHelper::plugin()->event('BeforeCheckoutValidateGuestShipping', [&$json]);
 
@@ -1038,6 +1109,7 @@ class CheckoutController extends BaseController
             $shippingRates = $filterEvent->getArgument('rates', $shippingRates);
 
             $shippingRates = CartOrder::sortShippingRates($shippingRates, ConfigHelper::autoApplyShippingRate());
+            $shippingRates = array_values(array_filter($shippingRates, [CartOrder::class, 'rateChargesAreValid']));
 
             // Auto-select the first rate if no selection exists or previous selection is no longer available
             if (!empty($shippingRates)) {
@@ -1061,6 +1133,7 @@ class CheckoutController extends BaseController
                     $shippingValues['shipping_tax']          = (string) ((float) ($matchedRate['tax'] ?? 0));
                     $shippingValues['shipping_tax_class_id'] = (int) ($matchedRate['tax_class_id'] ?? 0);
                     $shippingValues['shipping_price']        = (string) ((float) ($matchedRate['price'] ?? 0));
+                    $shippingValues['shipping_tax_resolved'] = CartOrder::rateTaxIsResolved($matchedRate);
                     $session->set('shipping_values', $shippingValues, 'j2commerce');
                 }
 
@@ -1074,6 +1147,7 @@ class CheckoutController extends BaseController
                         'shipping_tax'          => (string) ((float) ($defaultRate['tax'] ?? 0)),
                         'shipping_tax_class_id' => (int) ($defaultRate['tax_class_id'] ?? 0),
                         'shipping_extra'        => $defaultRate['extra'] ?? '',
+                        'shipping_tax_resolved' => CartOrder::rateTaxIsResolved($defaultRate),
                     ];
                     $session->set('shipping_values', $shippingValues, 'j2commerce');
                     $session->set('shipping_method', $shippingValues['shipping_plugin'], 'j2commerce');
@@ -1607,10 +1681,10 @@ class CheckoutController extends BaseController
             return;
         } // end isOwningRequest() block
 
-        $this->replayPaymentValues();
-
         try {
-            $order = $this->getCartOrder();
+            $order = $this->buildCartOrder();
+
+            $this->repriceShippingSelection($order, $errors);
 
             // Stock is enforced at add-to-cart and quantity-update, but time passes
             // before confirm — re-check here so two shoppers cannot both buy the last
@@ -1683,8 +1757,7 @@ class CheckoutController extends BaseController
         $vouchers   = [];
 
         if (!$errors && $order) {
-            $order->orderpayment_type = $orderpaymentType;
-            $order->applyPaymentSurcharge();
+            $this->applyPaymentTo($order, $orderpaymentType);
 
             try {
                 // Idempotency guard: a prior confirm() for this cart in this session
@@ -1768,9 +1841,22 @@ class CheckoutController extends BaseController
 
                 $order = $savedOrder;
             } catch (\Exception $e) {
-                // Order persistence + PrePayment plugin rendering. Gateway setup
-                // failures carry API keys and SQL in their messages.
-                Log::add('checkout.confirm saveOrder/PrePayment failed: ' . $e->getMessage(), Log::ERROR, 'com_j2commerce');
+                // Order persistence + PrePayment plugin rendering. Gateway setup failures
+                // carry API keys and SQL in their messages, and com_j2commerce.log.php
+                // outlives the request that wrote it, so the entry keeps what locates the
+                // failure — type, code, throw site, order — and not what caused it.
+                Log::add(
+                    \sprintf(
+                        'checkout.confirm saveOrder/PrePayment failed: %s (code %s) at %s:%d, order %s',
+                        $e::class,
+                        $e->getCode(),
+                        $e->getFile(),
+                        $e->getLine(),
+                        $savedOrder->order_id ?? 'none'
+                    ),
+                    Log::ERROR,
+                    'com_j2commerce'
+                );
 
                 $errors[] = Text::_('COM_J2COMMERCE_ERR_GENERIC');
             }
@@ -2041,29 +2127,46 @@ class CheckoutController extends BaseController
             && (int) ($orderTable->order_state_id ?? 0) === 5
         ) {
             try {
-                $currentOrder = $this->getCartOrder();
+                // Built through the same two steps the confirm step used to produce the
+                // row on disk, so the two sides of the comparison cannot drift apart by
+                // being assembled differently.
+                $currentOrder = $this->buildCartOrder();
 
-                if ($currentOrder instanceof CartOrder && $currentOrder->getItems()) {
-                    $currentOrder->orderpayment_type = (string) ($orderTable->orderpayment_type ?? '');
-                    $currentOrder->applyPaymentSurcharge();
+                if ($currentOrder && $currentOrder->getItems()) {
+                    $this->applyPaymentTo($currentOrder, (string) ($orderTable->orderpayment_type ?? ''));
+                } else {
+                    $currentOrder = null;
+                }
 
-                    if (!$this->orderMatchesCart($orderTable, $currentOrder)) {
-                        $message = Text::_('COM_J2COMMERCE_CHECKOUT_ERROR_ORDER_OUT_OF_DATE');
-                        $paction = $this->input->getString('paction', '');
-                        $isAjax  = $paction === 'process'
-                            || strtolower($this->input->server->getString('HTTP_X_REQUESTED_WITH', '')) === 'xmlhttprequest';
+                if ($currentOrder && !$this->orderMatchesCart($orderTable, $currentOrder)) {
+                    // Re-running the confirm step is what puts this right: it declines the
+                    // stale row, persists one built from the cart as it stands, and hands
+                    // the payment plugin the amount that comes out of it. So the step is
+                    // re-fetched rather than leaving the shopper holding a row that cannot
+                    // be paid for and no way to replace it.
+                    //
+                    // The shopper is told either way. Reaching here means the amount about
+                    // to be charged is not the amount on screen, and a redraw that says
+                    // nothing is indistinguishable from a button that did nothing.
+                    $message = Text::_('COM_J2COMMERCE_CHECKOUT_ERROR_ORDER_OUT_OF_DATE');
+                    $paction = $this->input->getString('paction', '');
+                    $isAjax  = $paction === 'process'
+                        || strtolower($this->input->server->getString('HTTP_X_REQUESTED_WITH', '')) === 'xmlhttprequest';
 
-                        if ($isAjax) {
-                            $this->jsonResponse(['success' => false, 'error' => $message]);
-
-                            return;
-                        }
-
-                        $this->app->enqueueMessage($message, 'warning');
-                        $this->app->redirect($this->getCheckoutUrl());
+                    if ($isAjax) {
+                        $this->jsonResponse([
+                            'success'         => false,
+                            'error'           => $message,
+                            'refresh_confirm' => true,
+                        ]);
 
                         return;
                     }
+
+                    $this->app->enqueueMessage($message, 'warning');
+                    $this->app->redirect($this->getCheckoutUrl());
+
+                    return;
                 }
             } catch (\Throwable $e) {
                 // The comparison could not be made. Refusing on that would strand a
@@ -2319,6 +2422,133 @@ class CheckoutController extends BaseController
     }
 
     /**
+     * Turn the current cart into an order.
+     *
+     * The payment values are replayed first because a fee a plugin calculates from
+     * them belongs to the total this produces.
+     */
+    private function buildCartOrder(): ?CartOrder
+    {
+        $this->replayPaymentValues();
+
+        $order = $this->getCartOrder();
+
+        return $order instanceof CartOrder ? $order : null;
+    }
+
+    /**
+     * Drop the shipping selection along with the offer list it was made from. A destination
+     * change invalidates both, and a selection that outlives its list is priced for an address
+     * the order is no longer going to.
+     */
+    private function clearShippingSelection(): void
+    {
+        $session = $this->app->getSession();
+
+        $session->clear('shipping_method', 'j2commerce');
+        $session->clear('shipping_methods', 'j2commerce');
+        $session->clear('shipping_values', 'j2commerce');
+    }
+
+    /**
+     * Re-price the stored shipping selection against a fresh dispatch before the order is built
+     * from it. The shipping step is where a selection is normally re-made, but nothing sequences
+     * the checkout tasks, so confirm cannot assume it was the last step to run.
+     *
+     * @param   CartOrder|null  $order   Replaced when the fresh rate differs from the stored one.
+     * @param   array           $errors  Appended to when the selection cannot stand and the
+     *                                   store requires one — see COM_J2COMMERCE_CONFIG_SHIPPING_REQUIRED.
+     */
+    private function repriceShippingSelection(?CartOrder &$order, array &$errors): void
+    {
+        if (!$order instanceof CartOrder || !$this->determineShowShippingMethods($order)) {
+            return;
+        }
+
+        $session = $this->app->getSession();
+        $stored  = $session->get('shipping_values', [], 'j2commerce');
+        $stored  = \is_array($stored) ? $stored : [];
+        $plugin  = (string) ($stored['shipping_plugin'] ?? '');
+
+        // One dispatch answers both questions this method asks — what is on offer for the
+        // destination, and whether the stored selection is still among it. A carrier plugin
+        // bills for the answer, so it is asked once.
+        $rates = array_values(array_filter(
+            CartOrder::collectShippingRates($order),
+            [CartOrder::class, 'rateChargesAreValid']
+        ));
+
+        // Money comes from the rate the plugins offer now, never from what the session carried.
+        $resolved = $plugin === ''
+            ? null
+            : CartOrder::matchShippingRate(
+                $rates,
+                $plugin,
+                (string) ($stored['shipping_name'] ?? ''),
+                (string) ($stored['shipping_code'] ?? '')
+            );
+
+        if ($resolved === null) {
+            // Nothing to bind: the shipping step was never reached, an address change cleared
+            // the selection and it was never re-made, or the rate it named is no longer offered
+            // here. A destination the plugins quote for demands a selection out of what they
+            // quoted. Where they quote nothing there is nothing to select, and the order stands
+            // on the store's own answer to whether shipping is required of it at all.
+            if ($rates !== [] || ConfigHelper::isShippingMandatory()) {
+                $errors[] = Text::_('COM_J2COMMERCE_CHECKOUT_SELECT_A_SHIPPING_METHOD');
+
+                return;
+            }
+
+            $this->clearShippingSelection();
+
+            $resolved = CartOrder::emptyShippingValues();
+        }
+
+        // Re-pricing answers for the destination, not for the tax: where a tax source has
+        // already answered for this line, its figure stands, because the rate's own tax is
+        // the estimate that figure exists to replace. It stands only over the charge it was
+        // given for, though — a rate that re-quotes to a different amount invalidates the
+        // tax on it as surely as a different destination would, so the answer is dropped and
+        // the source is left to give one for the new charge.
+        $sameCharge = (float) ($stored['shipping_price'] ?? 0) === (float) ($resolved['shipping_price'] ?? 0)
+            && (float) ($stored['shipping_extra'] ?? 0) === (float) ($resolved['shipping_extra'] ?? 0);
+
+        if (!empty($stored['shipping_tax_resolved']) && $sameCharge) {
+            $resolved['shipping_tax']          = (string) (float) ($stored['shipping_tax'] ?? 0);
+            $resolved['shipping_tax_resolved'] = true;
+        }
+
+        $session->set('shipping_values', $resolved, 'j2commerce');
+
+        $charges = static fn (array $values): array => [
+            (float) ($values['shipping_price'] ?? 0),
+            (float) ($values['shipping_tax'] ?? 0),
+            (float) ($values['shipping_extra'] ?? 0),
+            (int) ($values['shipping_tax_class_id'] ?? 0),
+            !empty($values['shipping_tax_resolved']),
+        ];
+
+        if ($charges($stored) === $charges($resolved)) {
+            return;
+        }
+
+        // The order in hand was built from the superseded figures — build it again from these.
+        $rebuilt = $this->getCartOrder();
+
+        if ($rebuilt instanceof CartOrder) {
+            $order = $rebuilt;
+        }
+    }
+
+    /** Attach the payment method and fold in its surcharge. */
+    private function applyPaymentTo(CartOrder $order, string $orderpaymentType): void
+    {
+        $order->orderpayment_type = $orderpaymentType;
+        $order->applyPaymentSurcharge();
+    }
+
+    /**
      * Whether a persisted order still describes the cart being confirmed.
      *
      * Compares the money the shopper would be charged and the lines that money is
@@ -2331,9 +2561,11 @@ class CheckoutController extends BaseController
         $scale  = CurrencyHelper::getDecimalPlace(ConfigHelper::getDefaultCurrency());
         $factor = 10 ** $scale;
 
-        // Compared in the currency's own minor units: saveOrder() rounds to the same
-        // scale before storing, so equal purchases compare exactly and no float
-        // tolerance has to be invented.
+        // Compared in the currency's own minor units. The stored side was rounded to
+        // this scale by saveOrder() and the cart's carries whatever precision the tax
+        // and fee arithmetic produced (an 8.25% tax on 6.75 is 0.556875), so rounding
+        // both to scale is what puts them on the same footing — the cart total is not
+        // compared raw.
         $storedTotal  = (int) round(((float) ($priorOrder->order_total ?? 0)) * $factor);
         $currentTotal = (int) round(((float) ($cartOrder->order_total ?? 0)) * $factor);
 
@@ -2782,7 +3014,7 @@ class CheckoutController extends BaseController
     {
         $params = J2CommerceHelper::config();
 
-        if ($params->get('show_shipping_address', 0)) {
+        if ($params->get('show_shipping_address', 1)) {
             return true;
         }
 

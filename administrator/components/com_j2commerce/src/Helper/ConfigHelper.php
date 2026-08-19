@@ -58,9 +58,9 @@ class ConfigHelper
      *
      * @param   array<int, array<string, mixed>>  $default  Fallback rows when config is empty/invalid.
      *
-     * @return  array<int, array{directory: string, thumbs: int}>
+     * @return  array<int, array{directory: string}>
      */
-    public static function getImageDirectories(array $default = [['directory' => 'images', 'thumbs' => 1]]): array
+    public static function getImageDirectories(array $default = [['directory' => 'images/products']]): array
     {
         $normalized = self::normalizeImageDirectories(self::get('image_directories', $default));
 
@@ -70,7 +70,7 @@ class ConfigHelper
 
         $fallback = self::normalizeImageDirectories($default);
 
-        return $fallback !== [] ? $fallback : [['directory' => 'images', 'thumbs' => 1]];
+        return $fallback !== [] ? $fallback : [['directory' => 'images/products']];
     }
 
     /**
@@ -88,11 +88,11 @@ class ConfigHelper
             $directory = trim((string) $directory, '/');
 
             if ($directory !== '') {
-                $defaultRows[] = ['directory' => $directory, 'thumbs' => 1];
+                $defaultRows[] = ['directory' => $directory];
             }
         }
 
-        $directories = self::getImageDirectories($defaultRows ?: [['directory' => 'images', 'thumbs' => 1]]);
+        $directories = self::getImageDirectories($defaultRows ?: [['directory' => 'images']]);
         $paths       = [];
 
         foreach ($directories as $directory) {
@@ -121,7 +121,7 @@ class ConfigHelper
     }
 
     /**
-     * @return  array<int, array{directory: string, thumbs: int}>
+     * @return  array<int, array{directory: string}>
      */
     private static function normalizeImageDirectories(mixed $value): array
     {
@@ -163,10 +163,7 @@ class ConfigHelper
                 continue;
             }
 
-            $normalized[] = [
-                'directory' => $directory,
-                'thumbs'    => (int) ($row['thumbs'] ?? 0),
-            ];
+            $normalized[] = ['directory' => $directory];
         }
 
         return $normalized;
@@ -245,7 +242,7 @@ class ConfigHelper
      */
     public static function getStoreCountryId(): int
     {
-        return (int) self::get('country_id', 223);
+        return (int) self::get('country_id', 0);
     }
 
     /**
@@ -346,7 +343,7 @@ class ConfigHelper
      */
     public static function getDateFormat(): string
     {
-        return (string) self::get('date_format', 'Y-m-d H:i:s');
+        return (string) self::get('date_format', 'Y-m-d');
     }
 
     /**
@@ -359,7 +356,7 @@ class ConfigHelper
         $value = trim((string) self::get('attachmentfolderpath', ''));
         $value = trim(str_replace('\\', '/', $value), '/');
 
-        return $value !== '' ? $value : AttachmentDenyFileHelper::DEFAULT_PATH;
+        return $value !== '' ? $value : AttachmentDenyFileHelper::defaultPath();
     }
 
     /**
@@ -412,7 +409,8 @@ class ConfigHelper
         if ($created || !is_file($real . '/.htaccess')) {
             AttachmentDenyFileHelper::writeDenyPair(
                 $real,
-                AttachmentDenyFileHelper::ownsTree($real, $created, $relative === AttachmentDenyFileHelper::DEFAULT_PATH)
+                $relative,
+                AttachmentDenyFileHelper::ownsTree($real, $created, $relative === AttachmentDenyFileHelper::defaultPath())
             );
         }
 
@@ -472,18 +470,6 @@ class ConfigHelper
     }
 
     /**
-     * Check if manufacturer should be displayed
-     *
-     * @return  bool  True to show manufacturer
-     *
-     * @since   6.0.0
-     */
-    public static function showManufacturer(): bool
-    {
-        return (int) self::get('show_manufacturer', 0) === 1;
-    }
-
-    /**
      * Check if quantity field should be displayed
      *
      * @return  bool  True to show quantity field
@@ -505,18 +491,6 @@ class ConfigHelper
     public static function showPrice(): bool
     {
         return (int) self::get('show_price_field', 1) === 1;
-    }
-
-    /**
-     * Check if base price should be displayed (when special price exists)
-     *
-     * @return  bool  True to show base price
-     *
-     * @since   6.0.0
-     */
-    public static function showBasePrice(): bool
-    {
-        return (int) self::get('show_base_price', 1) === 1;
     }
 
     /**
@@ -553,18 +527,6 @@ class ConfigHelper
     public static function showOptionImage(): bool
     {
         return (int) self::get('image_for_product_options', 0) === 1;
-    }
-
-    /**
-     * Get the number of columns for related products
-     *
-     * @return  int  Number of columns (1-6)
-     *
-     * @since   6.0.0
-     */
-    public static function getRelatedProductColumns(): int
-    {
-        return (int) self::get('related_product_columns', 3);
     }
 
     /**
@@ -804,7 +766,7 @@ class ConfigHelper
      */
     public static function canApplyVoucherToShipping(): bool
     {
-        return (int) self::get('backend_voucher_to_shipping', 1) === 1;
+        return (int) self::get('backend_voucher_to_shipping', 0) === 1;
     }
 
     // =========================================================================
@@ -904,7 +866,7 @@ class ConfigHelper
      */
     public static function showCartThumbnails(): bool
     {
-        return (int) self::get('show_thumb_cart', 0) === 1;
+        return (int) self::get('show_thumb_cart', 1) === 1;
     }
 
     /**
@@ -940,7 +902,7 @@ class ConfigHelper
      */
     public static function getClearCartTiming(): string
     {
-        return (string) self::get('clear_cart', 'order_placed');
+        return (string) self::get('clear_cart', 'order_confirmed');
     }
 
     /**
@@ -981,18 +943,6 @@ class ConfigHelper
     public static function allowRegistration(): bool
     {
         return (int) self::get('allow_registration', 1) === 1;
-    }
-
-    /**
-     * Check if password validation is required during registration
-     *
-     * @return  bool  True if required
-     *
-     * @since   6.0.0
-     */
-    public static function requirePasswordValidation(): bool
-    {
-        return (int) self::get('allow_password_validation', 1) === 1;
     }
 
     /**
@@ -1144,7 +1094,13 @@ class ConfigHelper
     }
 
     /**
-     * Get the order statuses that allow downloads
+     * Get the order statuses that allow downloads.
+     *
+     * Callers gate a grant with `in_array($status, ...)`, so an empty list here would
+     * release downloads on no status at all. It falls back to Confirmed rather than the
+     * field's own empty default for that reason. `DownloadHelper::allowedDownloadStatuses()`
+     * reads the same key for the serve-time query, where an empty list means the setting
+     * adds no `WHERE` and so places no restriction.
      *
      * @return  array<int>  Array of order status IDs
      *
@@ -1174,7 +1130,7 @@ class ConfigHelper
      */
     public static function showEmailThumbnails(): bool
     {
-        return (int) self::get('show_thumb_email', 0) === 1;
+        return (int) self::get('show_thumb_email', 1) === 1;
     }
 
     /**
@@ -1214,7 +1170,7 @@ class ConfigHelper
      */
     public static function showTerms(): bool
     {
-        return (int) self::get('show_terms', 1) === 1;
+        return (int) self::get('show_terms', 0) === 1;
     }
 
     /**

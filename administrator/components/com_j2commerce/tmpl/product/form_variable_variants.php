@@ -18,7 +18,7 @@ use J2Commerce\Component\J2commerce\Administrator\Helper\J2CommerceHelper;
 use Joomla\CMS\Factory;
 use Joomla\CMS\HTML\HTMLHelper;
 use Joomla\CMS\Language\Text;
-use Joomla\CMS\Layout\FileLayout;
+use Joomla\CMS\Layout\LayoutHelper;
 use Joomla\CMS\Router\Route;
 use Joomla\CMS\Session\Session;
 
@@ -32,6 +32,9 @@ $style = '.com_j2commerce .fa-stack.small{width:1.25rem;height:1.25rem;line-heig
     . '.com_j2commerce .fa-stack.small .fa-stack-2x{font-size:1rem;}'
     . '.com_j2commerce .fa-stack.small .fa-stack-1x{font-size:0.5rem;top:50%;left:50%;transform:translate(-50%,-50%);}';
 $wa->addInlineStyle($style, [], []);
+
+// Adopts the variant list this view fetches. Deferred, so it has run before any fetch callback.
+$wa->registerAndUseScript('com_j2commerce.dom', 'media/com_j2commerce/js/site/j2commerce-dom.js', [], ['defer' => true]);
 
 $item        = $displayData['product'];
 $formPrefix = $displayData['form_prefix'] ?? 'jform[attribs][j2commerce]';
@@ -89,23 +92,22 @@ $ajaxBase    = json_encode(\Joomla\CMS\Uri\Uri::base() . 'index.php');
 
         <?php endif; ?>
 
+        <?php
+        // Rendering a page of variants inline costs seconds and megabytes of markup, and the
+        // browser cannot paint anything until it finishes. The count is known here, so the panel
+        // opens on a skeleton of the right length and fetches page 1 through the same path
+        // pagination already uses. A product with no variants says so straight away.
+        $variantTotal = (int) ($item->variant_pagination->total ?? 0);
+        ?>
         <div class="j2commerce-advancedvariants-settings">
-            <div class="accordion" id="accordion">
-                <?php
-                $variant_list       = $item->variants;
-                $variant_pagination = $item->variant_pagination;
-                $weights            = $item->weights;
-                $lengths            = $item->lengths;
-                $layout = new FileLayout('form_ajax_avoptions', JPATH_ADMINISTRATOR . '/components/com_j2commerce/tmpl/product');
-                echo $layout->render([
-                    'product'            => $item,
-                    'variant_list'       => $variant_list,
-                    'variant_pagination' => $variant_pagination,
-                    'weights'            => $weights,
-                    'lengths'            => $lengths,
-                    'form_prefix'        => $formPrefix,
-                ]);
-                ?>
+            <div class="accordion" id="accordion"
+                 data-variant-total="<?php echo $variantTotal; ?>"
+                 data-variant-deferred="<?php echo $variantTotal > 0 ? '1' : '0'; ?>">
+                <?php if ($variantTotal > 0) : ?>
+                    <?php echo LayoutHelper::render('product.variant_skeleton', ['rows' => min($variantTotal, (int) $limit)], JPATH_ADMINISTRATOR . '/components/com_j2commerce/layouts'); ?>
+                <?php else : ?>
+                    <div class="alert alert-info"><?php echo Text::_('COM_J2COMMERCE_NO_VARIANTS'); ?></div>
+                <?php endif; ?>
             </div>
         </div>
     </fieldset>
@@ -388,7 +390,7 @@ $ajaxBase    = json_encode(\Joomla\CMS\Uri\Uri::base() . 'index.php');
             }
             var countDisplay = document.querySelector('.j2commerce-variant-pagination .text-end');
             if (countDisplay) {
-                countDisplay.textContent = total + ' <?php echo Text::_('COM_J2COMMERCE_PRODUCT_TAB_VARIANTS'); ?>';
+                countDisplay.textContent = total + ' ' + <?php echo json_encode(Text::_('COM_J2COMMERCE_PRODUCT_TAB_VARIANTS')); ?>;
             }
             this.rebuildPagination();
             this.updateToolbarVisibility(total);
@@ -419,7 +421,7 @@ $ajaxBase    = json_encode(\Joomla\CMS\Uri\Uri::base() . 'index.php');
             if (!paginationWrapper) {
                 paginationWrapper = document.createElement('nav');
                 paginationWrapper.className = 'pagination__wrapper j2commerce-variant-pagination';
-                paginationWrapper.setAttribute('aria-label', '<?php echo Text::_('JLIB_HTML_PAGINATION'); ?>');
+                paginationWrapper.setAttribute('aria-label', <?php echo json_encode(Text::_('JLIB_HTML_PAGINATION')); ?>);
                 var countRow = document.createElement('div');
                 countRow.className = 'text-end';
                 countRow.textContent = this.config.totalVariants + ' ' + <?php echo json_encode(Text::_('COM_J2COMMERCE_PRODUCT_TAB_VARIANTS')); ?>;
@@ -470,6 +472,55 @@ $ajaxBase    = json_encode(\Joomla\CMS\Uri\Uri::base() . 'index.php');
             }
         },
 
+        // A skeleton of the expected length, so the wait never reads as "there are none".
+        showSkeleton: function (accordion, rows) {
+            var count = Math.max(1, Math.min(rows || 1, 20));
+            var frag  = document.createDocumentFragment();
+
+            var wrapper = document.createElement('div');
+            wrapper.className = 'j2commerce-variant-skeleton';
+            wrapper.setAttribute('role', 'status');
+            wrapper.setAttribute('aria-live', 'polite');
+
+            var srLabel = document.createElement('span');
+            srLabel.className = 'visually-hidden';
+            srLabel.textContent = <?php echo json_encode(Text::_('COM_J2COMMERCE_LOADING')); ?>;
+            wrapper.append(srLabel);
+
+            for (var i = 0; i < count; i++) {
+                var row = document.createElement('div');
+                row.className = 'variant-item border mb-3 rounded-3 px-3 py-2 placeholder-glow';
+                row.setAttribute('aria-hidden', 'true');
+
+                var inner = document.createElement('div');
+                inner.className = 'd-flex align-items-center';
+                ['placeholder rounded me-2', 'placeholder rounded me-2', 'placeholder col-4 rounded', 'placeholder col-2 rounded ms-auto']
+                    .forEach(function (cls, index) {
+                        var bar = document.createElement('span');
+                        bar.className = cls;
+                        if (index < 2) {
+                            bar.style.width  = index === 0 ? '1rem' : '1.5rem';
+                            bar.style.height = index === 0 ? '1rem' : '1.5rem';
+                        }
+                        inner.append(bar);
+                    });
+
+                row.append(inner);
+                wrapper.append(row);
+            }
+
+            frag.append(wrapper);
+            accordion.replaceChildren(frag);
+        },
+
+        // Shown only once a load has finished and genuinely produced nothing.
+        showEmptyNotice: function (accordion, message) {
+            var notice = document.createElement('div');
+            notice.className = 'alert alert-info';
+            notice.textContent = message || <?php echo json_encode(Text::_('COM_J2COMMERCE_NO_VARIANTS')); ?>;
+            accordion.replaceChildren(notice);
+        },
+
         loadVariantList: function (limitstart) {
             limitstart = limitstart || 0;
             var accordion = document.getElementById('accordion');
@@ -478,6 +529,9 @@ $ajaxBase    = json_encode(\Joomla\CMS\Uri\Uri::base() . 'index.php');
             this.config.currentPage = Math.floor(limitstart / this.config.limit) + 1;
 
             var self = this;
+            var expected = this.config.totalVariants - limitstart;
+            this.showSkeleton(accordion, expected > 0 ? Math.min(expected, this.config.limit) : this.config.limit);
+
             var formData = new FormData();
             formData.append('option', 'com_j2commerce');
             formData.append('task', 'products.getVariantListAjax');
@@ -486,29 +540,42 @@ $ajaxBase    = json_encode(\Joomla\CMS\Uri\Uri::base() . 'index.php');
             formData.append('limit', this.config.limit);
             formData.append('form_prefix', this.config.formPrefix);
             formData.append('variant_layout', 'form_ajax_avoptions');
+            formData.append(csrfToken, '1');
 
             fetch(J2COMMERCE_AJAX_BASE, { method: 'POST', body: formData })
-                .then(function (response) { return response.json(); })
+                .then(function (response) {
+                    if (!response.ok) {
+                        throw new Error('Network response was not ok');
+                    }
+                    return response.json();
+                })
                 .then(function (data) {
-                    if (data.html) {
-                        accordion.innerHTML = data.html;
+                    var total = typeof data.total !== 'undefined' ? parseInt(data.total, 10) || 0 : 0;
+
+                    if (total === 0) {
+                        self.showEmptyNotice(accordion);
+                    } else if (data.html) {
+                        J2CommerceDom.adopt(accordion, data.html);
                         self.setupCheckboxHandlers();
                         initVariantItemHandlers();
                         // Dispatched on the container, not document: core showon.js reads event.target.classList.
                         accordion.dispatchEvent(new CustomEvent('joomla:updated', { bubbles: true }));
+                    } else {
+                        // The product has variants, this page of them does not.
+                        self.showEmptyNotice(accordion, txtNoResults);
                     }
-                    if (typeof data.total !== 'undefined') {
-                        self.updateVariantCount(data.total);
-                    }
+
+                    self.updateVariantCount(total);
                 })
                 .catch(function (error) {
                     console.error('Error loading variant list:', error);
-                    self.showMessage('<?php echo Text::_('COM_J2COMMERCE_ERROR_LOADING_VARIANTS'); ?>', 'error');
+                    self.showEmptyNotice(accordion, txtNoResults);
+                    self.showMessage(<?php echo json_encode(Text::_('COM_J2COMMERCE_ERROR_LOADING_VARIANTS')); ?>, 'error');
                 });
         },
 
         generateVariants: function () {
-            if (!confirm('<?php echo Text::_('COM_J2COMMERCE_PRODUCT_VARIANT_REGENERATE_HELP'); ?>')) {
+            if (!confirm(<?php echo json_encode(Text::_('COM_J2COMMERCE_PRODUCT_VARIANT_REGENERATE_HELP')); ?>)) {
                 return;
             }
 
@@ -526,16 +593,16 @@ $ajaxBase    = json_encode(\Joomla\CMS\Uri\Uri::base() . 'index.php');
                 .then(function (response) { return response.json(); })
                 .then(function (data) {
                     if (data.success) {
-                        self.showMessage(data.message || '<?php echo Text::_('COM_J2COMMERCE_VARIANTS_GENERATED'); ?>');
+                        self.showMessage(data.message || <?php echo json_encode(Text::_('COM_J2COMMERCE_VARIANTS_GENERATED')); ?>);
                         self.updateVariantCount(data.total || 0);
                         self.loadVariantList(0);
                     } else {
-                        self.showMessage(data.message || '<?php echo Text::_('COM_J2COMMERCE_ERROR_GENERATING_VARIANTS'); ?>', 'error');
+                        self.showMessage(data.message || <?php echo json_encode(Text::_('COM_J2COMMERCE_ERROR_GENERATING_VARIANTS')); ?>, 'error');
                     }
                 })
                 .catch(function (error) {
                     console.error('Error generating variants:', error);
-                    self.showMessage('<?php echo Text::_('COM_J2COMMERCE_ERROR_GENERATING_VARIANTS'); ?>', 'error');
+                    self.showMessage(<?php echo json_encode(Text::_('COM_J2COMMERCE_ERROR_GENERATING_VARIANTS')); ?>, 'error');
                 })
                 .finally(function () {
                     self.setButtonLoading(btn, false);
@@ -543,7 +610,7 @@ $ajaxBase    = json_encode(\Joomla\CMS\Uri\Uri::base() . 'index.php');
         },
 
         regenerateVariants: function () {
-            if (!confirm('<?php echo Text::_('COM_J2COMMERCE_PRODUCT_VARIANT_REGENERATE_HELP'); ?>')) {
+            if (!confirm(<?php echo json_encode(Text::_('COM_J2COMMERCE_PRODUCT_VARIANT_REGENERATE_HELP')); ?>)) {
                 return;
             }
 
@@ -561,16 +628,16 @@ $ajaxBase    = json_encode(\Joomla\CMS\Uri\Uri::base() . 'index.php');
                 .then(function (response) { return response.json(); })
                 .then(function (data) {
                     if (data.success) {
-                        self.showMessage(data.message || '<?php echo Text::_('COM_J2COMMERCE_VARIANTS_REGENERATED'); ?>');
+                        self.showMessage(data.message || <?php echo json_encode(Text::_('COM_J2COMMERCE_VARIANTS_REGENERATED')); ?>);
                         self.updateVariantCount(data.total || 0);
                         self.loadVariantList(0);
                     } else {
-                        self.showMessage(data.message || '<?php echo Text::_('COM_J2COMMERCE_ERROR_GENERATING_VARIANTS'); ?>', 'error');
+                        self.showMessage(data.message || <?php echo json_encode(Text::_('COM_J2COMMERCE_ERROR_GENERATING_VARIANTS')); ?>, 'error');
                     }
                 })
                 .catch(function (error) {
                     console.error('Error regenerating variants:', error);
-                    self.showMessage('<?php echo Text::_('COM_J2COMMERCE_ERROR_GENERATING_VARIANTS'); ?>', 'error');
+                    self.showMessage(<?php echo json_encode(Text::_('COM_J2COMMERCE_ERROR_GENERATING_VARIANTS')); ?>, 'error');
                 })
                 .finally(function () {
                     self.setButtonLoading(btn, false);
@@ -578,7 +645,7 @@ $ajaxBase    = json_encode(\Joomla\CMS\Uri\Uri::base() . 'index.php');
         },
 
         deleteAllVariants: function () {
-            if (!confirm('<?php echo Text::_('COM_J2COMMERCE_CONFIRM_DELETE_ALL_VARIANTS'); ?>')) {
+            if (!confirm(<?php echo json_encode(Text::_('COM_J2COMMERCE_CONFIRM_DELETE_ALL_VARIANTS')); ?>)) {
                 return;
             }
 
@@ -599,20 +666,17 @@ $ajaxBase    = json_encode(\Joomla\CMS\Uri\Uri::base() . 'index.php');
                         self.cleanupAllVariantSyncInputs();
                         var accordion = document.getElementById('accordion');
                         if (accordion) {
-                            const emptyNotice = document.createElement('div');
-                            emptyNotice.className = 'alert alert-info';
-                            emptyNotice.textContent = <?php echo json_encode(Text::_('COM_J2COMMERCE_NO_VARIANTS')); ?>;
-                            accordion.replaceChildren(emptyNotice);
+                            self.showEmptyNotice(accordion);
                         }
                         self.updateVariantCount(0);
-                        self.showMessage(data.message || '<?php echo Text::_('COM_J2COMMERCE_ALL_VARIANTS_DELETED'); ?>');
+                        self.showMessage(data.message || <?php echo json_encode(Text::_('COM_J2COMMERCE_ALL_VARIANTS_DELETED')); ?>);
                     } else {
-                        self.showMessage(data.message || '<?php echo Text::_('COM_J2COMMERCE_ERROR_DELETING_VARIANTS'); ?>', 'error');
+                        self.showMessage(data.message || <?php echo json_encode(Text::_('COM_J2COMMERCE_ERROR_DELETING_VARIANTS')); ?>, 'error');
                     }
                 })
                 .catch(function (error) {
                     console.error('Error deleting all variants:', error);
-                    self.showMessage('<?php echo Text::_('COM_J2COMMERCE_ERROR_DELETING_VARIANTS'); ?>', 'error');
+                    self.showMessage(<?php echo json_encode(Text::_('COM_J2COMMERCE_ERROR_DELETING_VARIANTS')); ?>, 'error');
                 })
                 .finally(function () {
                     self.setButtonLoading(btn, false);
@@ -622,11 +686,11 @@ $ajaxBase    = json_encode(\Joomla\CMS\Uri\Uri::base() . 'index.php');
         deleteSelectedVariants: function () {
             var checkedVariants = document.querySelectorAll('input[name="vid[]"]:checked');
             if (checkedVariants.length === 0) {
-                this.showMessage('<?php echo Text::_('COM_J2COMMERCE_NO_ITEM_SELECTED'); ?>', 'warning');
+                this.showMessage(<?php echo json_encode(Text::_('COM_J2COMMERCE_NO_ITEM_SELECTED')); ?>, 'warning');
                 return;
             }
 
-            if (!confirm('<?php echo Text::_('COM_J2COMMERCE_CONFIRM_DELETE_SELECTED_VARIANTS'); ?>')) {
+            if (!confirm(<?php echo json_encode(Text::_('COM_J2COMMERCE_CONFIRM_DELETE_SELECTED_VARIANTS')); ?>)) {
                 return;
             }
 
@@ -659,14 +723,14 @@ $ajaxBase    = json_encode(\Joomla\CMS\Uri\Uri::base() . 'index.php');
                             self.updateVariantCount(data.total);
                             self.updateCheckboxState();
                         }, 350);
-                        self.showMessage(data.message || '<?php echo Text::_('COM_J2COMMERCE_VARIANTS_DELETED'); ?>');
+                        self.showMessage(data.message || <?php echo json_encode(Text::_('COM_J2COMMERCE_VARIANTS_DELETED')); ?>);
                     } else {
-                        self.showMessage(data.message || '<?php echo Text::_('COM_J2COMMERCE_ERROR_DELETING_VARIANTS'); ?>', 'error');
+                        self.showMessage(data.message || <?php echo json_encode(Text::_('COM_J2COMMERCE_ERROR_DELETING_VARIANTS')); ?>, 'error');
                     }
                 })
                 .catch(function (error) {
                     console.error('Error deleting selected variants:', error);
-                    self.showMessage('<?php echo Text::_('COM_J2COMMERCE_ERROR_DELETING_VARIANTS'); ?>', 'error');
+                    self.showMessage(<?php echo json_encode(Text::_('COM_J2COMMERCE_ERROR_DELETING_VARIANTS')); ?>, 'error');
                 })
                 .finally(function () {
                     self.setButtonLoading(deleteBtn, false);
@@ -765,6 +829,13 @@ $ajaxBase    = json_encode(\Joomla\CMS\Uri\Uri::base() . 'index.php');
                     e.preventDefault();
                     self.deleteAllVariants();
                 });
+            }
+
+            // The panel ships a skeleton, not the rows; fetch page 1 through the path
+            // pagination already uses.
+            var accordion = document.getElementById('accordion');
+            if (accordion && accordion.dataset.variantDeferred === '1') {
+                this.loadVariantList(0);
             }
         }
     };

@@ -188,9 +188,9 @@ Text::script('COM_J2COMMERCE_CHECKOUT_ERROR_AGREE_TERMS');
                             aria-expanded="false"
                             aria-controls="checkoutSidecartCollapse">
                         <span class="d-flex align-items-center gap-2">
-                            <span class="icon-cart" aria-hidden="true"></span>
+                            <span class="fa-solid fa-cart-shopping" aria-hidden="true"></span>
                             <span class="j2commerce-sidecart-toggle-text"><?php echo Text::_('COM_J2COMMERCE_SHOW_ORDER_SUMMARY'); ?></span>
-                            <span class="icon-chevron-down small j2commerce-sidecart-chevron" aria-hidden="true"></span>
+                            <span class="fa-solid fa-chevron-down small j2commerce-sidecart-chevron" aria-hidden="true"></span>
                         </span>
                         <span class="fw-bold fs-5 j2commerce-sidecart-toggle-total"><?php echo $grandTotal; ?></span>
                     </button>
@@ -956,7 +956,9 @@ document.addEventListener('DOMContentLoaded', function() {
 
     function proceedAfterBilling() {
         var sameAsBilling = document.getElementById('shipping-same-as-billing');
-        var skipShippingAddress = sameAsBilling && sameAsBilling.checked;
+        // A hidden field stands in for the checkbox when the store has turned the
+        // shipping address off — it carries the same value but never reports .checked.
+        var skipShippingAddress = !!sameAsBilling && (sameAsBilling.type === 'hidden' || sameAsBilling.checked);
 
         if (showShipping && !skipShippingAddress) {
             var shipEl = document.getElementById('shipping-address');
@@ -1109,7 +1111,7 @@ document.addEventListener('DOMContentLoaded', function() {
     }
 
     function goToConfirm() {
-        fetchStep('confirm', 'confirm').then(function() {
+        return fetchStep('confirm', 'confirm').then(function() {
             hideAllContents();
             slideDown(getContent('confirm'));
             removeEditLinks();
@@ -1285,6 +1287,27 @@ document.addEventListener('DOMContentLoaded', function() {
             // Clear previous error/warning messages
             form.querySelectorAll('.j2error, .j2success, .j2warning, .warning, .alert-danger, .alert-success').forEach(function(el) { el.remove(); });
 
+            // The persisted order no longer describes the cart. Re-fetching the step
+            // rebuilds and re-persists it and re-initialises the payment plugin with
+            // the amount that comes out, so the corrected figures are on screen by the
+            // time the notice lands and the order can be placed again.
+            if (json.refresh_confirm) {
+                var refreshMsg = typeof json.error === 'string' ? json.error : '';
+
+                // Left disabled until the corrected step is on screen, so a second click
+                // cannot place the order against figures that are still being replaced.
+                goToConfirm().then(function() {
+                    var refreshed = getContent('confirm');
+                    if (refreshed && refreshMsg) {
+                        showWarning(refreshed, refreshMsg);
+                    }
+                }).catch(function() {
+                    btn.disabled = false;
+                });
+
+                return;
+            }
+
             if (json.error) {
                 var confirmContent = document.getElementById('confirm') && document.getElementById('confirm').querySelector('.checkout-content');
                 if (json.error.tos_check) {
@@ -1421,10 +1444,7 @@ document.addEventListener('DOMContentLoaded', function() {
             .then(function(data) {
                 if (data.success && data.html) {
                     var container = document.getElementById('checkout-sidecart-content');
-                    if (container) {
-                        var parsed = new DOMParser().parseFromString(data.html, 'text/html');
-                        container.replaceChildren.apply(container, Array.from(parsed.body.childNodes));
-                    }
+                    J2CommerceDom.adopt(container, data.html);
                     updateMobileTotal();
                 }
             })

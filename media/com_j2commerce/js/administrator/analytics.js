@@ -420,12 +420,22 @@
         return { pct: Math.abs(Math.round(pct * 10) / 10), dir };
     }
 
-    function changeHtml(change) {
+    function changeNode(change) {
+        const wrapper = document.createElement('span');
+
         if (change.dir === 'flat') {
-            return '<span class="text-body-secondary">\u2014</span>';
+            wrapper.className = 'text-body-secondary';
+            wrapper.textContent = '\u2014';
+
+            return wrapper;
         }
-        const icon = change.dir === 'up' ? 'fa-arrow-up' : 'fa-arrow-down';
-        return '<span><span class="fa-solid ' + icon + '" aria-hidden="true"></span> ' + change.pct + '%</span>';
+
+        const icon = document.createElement('span');
+        icon.className = 'fa-solid ' + (change.dir === 'up' ? 'fa-arrow-up' : 'fa-arrow-down');
+        icon.setAttribute('aria-hidden', 'true');
+        wrapper.append(icon, ' ' + change.pct + '%');
+
+        return wrapper;
     }
 
     function updateKPIs(data) {
@@ -455,7 +465,7 @@
 
         const setChange = (id, change) => {
             const el = document.getElementById(id);
-            if (el) el.replaceChildren(document.createRange().createContextualFragment(changeHtml(change)));
+            if (el) el.replaceChildren(changeNode(change));
         };
 
         setChange('kpi-revenue-change', revenueChange);
@@ -464,30 +474,41 @@
         setChange('kpi-items-change', itemsChange);
     }
 
-    function escapeHtml(str) {
-        const div = document.createElement('div');
-        div.textContent = str;
-        return div.innerHTML;
-    }
-
     function updateTopProducts(products) {
         const tbody = document.querySelector('#analytics-products tbody');
         if (!tbody) return;
 
         if (!products || !products.length) {
-            const noDataText = Joomla.Text._('COM_J2COMMERCE_ANALYTICS_NO_DATA');
-            tbody.replaceChildren(document.createRange().createContextualFragment('<tr><td colspan="4" class="text-center text-body-secondary">' + escapeHtml(noDataText) + '</td></tr>'));
+            const noDataCell = document.createElement('td');
+            noDataCell.colSpan = 4;
+            noDataCell.className = 'text-center text-body-secondary';
+            noDataCell.textContent = Joomla.Text._('COM_J2COMMERCE_ANALYTICS_NO_DATA');
+
+            const noDataRow = document.createElement('tr');
+            noDataRow.appendChild(noDataCell);
+            tbody.replaceChildren(noDataRow);
             return;
         }
 
-        tbody.replaceChildren(document.createRange().createContextualFragment(products.map((p, i) =>
-            `<tr>
-                <td>${i + 1}</td>
-                <td>${escapeHtml(p.name)}</td>
-                <td class="text-end">${parseInt(p.total_qty, 10)}</td>
-                <td class="text-end">${escapeHtml(p.formatted_revenue || formatCurrency(p.total_revenue))}</td>
-            </tr>`
-        ).join('')));
+        tbody.replaceChildren(...products.map((p, i) => {
+            const row = document.createElement('tr');
+
+            const cells = [
+                { text: String(i + 1) },
+                { text: p.name },
+                { text: String(parseInt(p.total_qty, 10)), className: 'text-end' },
+                { text: p.formatted_revenue || formatCurrency(p.total_revenue), className: 'text-end' },
+            ];
+
+            cells.forEach(({ text, className }) => {
+                const cell = document.createElement('td');
+                if (className) cell.className = className;
+                cell.textContent = text;
+                row.appendChild(cell);
+            });
+
+            return row;
+        }));
     }
 
     async function refreshData() {

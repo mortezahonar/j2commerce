@@ -58,6 +58,11 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
             'method'          => 'cleanupOrderUploads',
             'form'            => 'cleanupOrderUploads',
         ],
+        'j2commerce.scheduledTick' => [
+            'langConstPrefix' => 'PLG_TASK_J2COMMERCE_SCHEDULED_TICK',
+            'method'          => 'scheduledTick',
+            'form'            => 'scheduledTick',
+        ],
     ];
 
     protected $autoloadLanguage = true;
@@ -230,7 +235,7 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
         foreach ($items as $item) {
             $queueId = (int) $item->j2commerce_queue_id;
 
-            $processEvent = new GenericEvent('onJ2CommerceQueueProcess', ['item' => $item]);
+            $processEvent = new GenericEvent('onJ2CommerceQueueProcess', ['queue' => $item, 'item' => $item]);
             $dispatcher->dispatch('onJ2CommerceQueueProcess', $processEvent);
 
             $currentItem = QueueHelper::getQueueById($queueId);
@@ -251,7 +256,7 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
             // eventually mark it 'dead', silently destroying valid queued work.
             QueueHelper::release($queueId);
             $skipped++;
-            $details[] = ['id' => $queueId, 'status' => 'skipped', 'note' => 'No handler processed this item (released)'];
+            $details[] = ['id' => $queueId, 'status' => 'skipped', 'error' => 'No handler processed this item (released)', 'note' => 'No handler processed this item (released)'];
         }
 
         $endMs       = (int) (microtime(true) * 1000);
@@ -364,6 +369,11 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
 
     private function updateCurrencyRates(ExecuteTaskEvent $event): int
     {
+        if (!ConfigHelper::isCurrencyAutoUpdateEnabled()) {
+            $this->logTask('Automatic currency updates are disabled in the component options.');
+            return Status::NO_RUN;
+        }
+
         PluginHelper::importPlugin('j2commerce');
 
         $dispatcher  = Factory::getApplication()->getDispatcher();
@@ -387,6 +397,49 @@ final class J2Commerce extends CMSPlugin implements SubscriberInterface
         return $result['failed'] > 0 && $result['updated'] === 0
             ? Status::KNOCKOUT
             : Status::OK;
+    }
+
+    private function scheduledTick(ExecuteTaskEvent $event): int
+    {
+        $params  = $event->getArgument('params');
+        $context = trim((string) ($params->context ?? ''));
+
+        // Register j2commerce-group subscribers before dispatching to them below. The console
+        // application never fires onAfterInitialise, so nothing else imports the group under cron.
+        PluginHelper::importPlugin('j2commerce');
+
+        $dispatcher = Factory::getApplication()->getDispatcher();
+        $listeners  = $dispatcher->getListeners('onJ2CommerceScheduledTick');
+
+        if (empty($listeners)) {
+            $this->logTask('No subscribers listening for onJ2CommerceScheduledTick.');
+            return Status::NO_RUN;
+        }
+
+        $tick   = new GenericEvent('onJ2CommerceScheduledTick', ['context' => $context, 'params' => $params]);
+        $ran    = 0;
+        $failed = 0;
+
+        // Invoked one listener at a time rather than through dispatch() so a subscriber that
+        // throws cannot abort the tick for the ones queued behind it.
+        foreach ($listeners as $listener) {
+            try {
+                $listener($tick);
+                $ran++;
+            } catch (\Throwable $e) {
+                $failed++;
+                $this->logTask(\sprintf('Subscriber failed: %s', $e->getMessage()));
+            }
+        }
+
+        $this->logTask(\sprintf(
+            'Scheduled tick%s: %d subscriber(s) ran, %d failed.',
+            $context !== '' ? ' (context: ' . $context . ')' : '',
+            $ran,
+            $failed
+        ));
+
+        return $ran === 0 ? Status::KNOCKOUT : Status::OK;
     }
 
     private function cleanupOrderUploads(ExecuteTaskEvent $event): int

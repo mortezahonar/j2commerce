@@ -12,13 +12,16 @@ declare(strict_types=1);
 
 namespace J2Commerce\Component\J2commerce\Site\Controller;
 
+use J2Commerce\Component\J2commerce\Administrator\Helper\CartHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\ConfigHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\CustomFieldHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\UploadHelper;
+use Joomla\CMS\Filter\InputFilter;
 use Joomla\CMS\Helper\MediaHelper;
 use Joomla\CMS\Language\Text;
 use Joomla\CMS\MVC\Controller\BaseController;
 use Joomla\CMS\Session\Session;
+use Joomla\Filesystem\Exception\FilesystemException;
 use Joomla\Filesystem\File;
 use Joomla\Filesystem\Folder;
 
@@ -44,8 +47,10 @@ class CheckoutuploaderController extends BaseController
             return;
         }
 
-        $session = $this->app->getSession();
-        $cartId  = (int) $session->get('j2commerce.cart_id', 0);
+        // Resolve the caller's own cart the way the rest of the cart path does — by user
+        // id, then session id, then signed cookie. Never create one from an upload.
+        $cart   = CartHelper::getInstance()->getCart(0, false);
+        $cartId = (int) ($cart->j2commerce_cart_id ?? 0);
 
         if ($cartId <= 0) {
             $this->sendJson(false, 'No active checkout session');
@@ -67,8 +72,17 @@ class CheckoutuploaderController extends BaseController
 
         // The field's own configured extension/size limits are published to Uppy as
         // data-* attributes; re-read and apply them here so the browser is not the
-        // only thing enforcing them.
-        $fieldError = CustomFieldHelper::validateMultiuploaderFile($input->getInt('customfield_id', 0), $file);
+        // only thing enforcing them. The id is on the upload URL the render step builds,
+        // so a request without one is not a shape this route serves — answering it with
+        // com_media's global configuration alone would be the opposite of re-reading.
+        $fieldOptions = CustomFieldHelper::multiuploaderOptions($input->getInt('customfield_id', 0));
+
+        if ($fieldOptions === null) {
+            $this->sendJson(false, Text::_('COM_J2COMMERCE_CHECKOUT_UPLOAD_FIELD_UNKNOWN'));
+            return;
+        }
+
+        $fieldError = CustomFieldHelper::validateMultiuploaderFile($fieldOptions, $file);
 
         if ($fieldError !== null) {
             $this->sendJson(false, $fieldError);
@@ -110,7 +124,22 @@ class CheckoutuploaderController extends BaseController
         $mangledName = UploadHelper::randomToken();
         $filePath    = $uploadPath . '/' . $savedName;
 
-        if (!File::upload($file['tmp_name'], $filePath)) {
+        // canUpload() settles the extension and the sniffed MIME but never reads the bytes,
+        // so a polyglot carrying PHP under an allowed extension passes it. isSafeFile()
+        // is the core scanner for that: chunked rather than whole-file, and it also catches
+        // the phar stub and a forbidden extension buried in any dot segment. The two content
+        // options are off because a customer's .txt or .zip legitimately trips them — a
+        // short tag is any '<?', and the archive test is a raw string search for '.php'.
+        if (!InputFilter::isSafeFile($file, ['shorttag_in_content' => false, 'fobidden_ext_in_content' => false])) {
+            $this->sendJson(false, Text::_('COM_J2COMMERCE_UPLOAD_FILE_PHP_TAGS'));
+            return;
+        }
+
+        // Framework File::upload() returns true or throws — it never returns false, so the
+        // client's JSON contract depends on catching rather than on testing the result.
+        try {
+            File::upload($file['tmp_name'], $filePath);
+        } catch (FilesystemException $e) {
             $this->sendJson(false, 'Failed to save file');
             return;
         }

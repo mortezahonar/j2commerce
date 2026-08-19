@@ -15,6 +15,7 @@ namespace J2Commerce\Component\J2commerce\Administrator\Controller;
 use J2Commerce\Component\J2commerce\Administrator\Helper\EmailHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\PackingSlipHelper;
 use Joomla\CMS\Language\Text;
+use Joomla\CMS\Log\Log;
 use Joomla\CMS\MVC\Controller\FormController;
 use Joomla\CMS\MVC\Model\BaseDatabaseModel;
 use Joomla\CMS\Router\Route;
@@ -185,8 +186,12 @@ class InvoicetemplateController extends FormController
     {
         Session::checkToken() or jexit(Text::_('JINVALID_TOKEN'));
 
-        $body      = $this->input->post->getRaw('body', '');
-        $customCss = trim($this->input->post->getRaw('custom_css', ''));
+        $body = $this->input->post->getRaw('body', '');
+
+        // Dropping '<' outright: a single pass at '</style' can be reassembled by a nested
+        // sequence, so the character the element cannot survive goes instead. The preview
+        // opens in a window rather than a frame, which cannot carry a sandbox attribute.
+        $customCss = trim(str_replace('<', '', $this->input->post->getRaw('custom_css', '')));
 
         // Restore data-j2c-src placeholders back to src (editor injects these to prevent 404s)
         // GrapesJS may reorder attributes, so data-j2c-src may not be adjacent to src
@@ -215,7 +220,9 @@ class InvoicetemplateController extends FormController
         $processedBody   = preg_replace_callback(
             '/<style\b[^>]*>(.*?)<\/style>/si',
             function (array $m) use (&$extractedStyles): string {
-                $extractedStyles .= $m[1] . "\n";
+                // The pattern only ends on a literal '</style>', so a bare '</style ' would
+                // survive extraction and close the element it is re-emitted into.
+                $extractedStyles .= str_replace('<', '', $m[1]) . "\n";
                 return '';
             },
             $processedBody
@@ -370,7 +377,8 @@ class InvoicetemplateController extends FormController
             // Check-in the original row.
             if ($checkin && $model->checkin($data[$key]) === false) {
                 // Check-in failed. Go back to the item and display a notice.
-                $this->setMessage(Text::sprintf('JLIB_APPLICATION_ERROR_CHECKIN_FAILED', $model->getError()), 'error');
+                Log::add('invoicetemplate.save2copy checkin failed: ' . $model->getError(), Log::ERROR, 'com_j2commerce');
+                $this->setMessage(Text::sprintf('JLIB_APPLICATION_ERROR_CHECKIN_FAILED', Text::_('COM_J2COMMERCE_ERR_GENERIC')), 'error');
 
                 $this->setRedirect(
                     Route::_(
@@ -405,7 +413,8 @@ class InvoicetemplateController extends FormController
         $form = $model->getForm($data, false);
 
         if (!$form) {
-            $app->enqueueMessage($model->getError(), 'error');
+            Log::add('invoicetemplate.getForm failed: ' . $model->getError(), Log::ERROR, 'com_j2commerce');
+            $app->enqueueMessage(Text::_('COM_J2COMMERCE_ERR_GENERIC'), 'error');
 
             return false;
         }
@@ -448,7 +457,8 @@ class InvoicetemplateController extends FormController
             $app->setUserState($context . '.data', $validData);
 
             // Redirect back to the edit screen.
-            $this->setMessage(Text::sprintf('JLIB_APPLICATION_ERROR_SAVE_FAILED', $model->getError()), 'error');
+            Log::add('invoicetemplate.save failed: ' . $model->getError(), Log::ERROR, 'com_j2commerce');
+            $this->setMessage(Text::sprintf('JLIB_APPLICATION_ERROR_SAVE_FAILED', Text::_('COM_J2COMMERCE_ERR_GENERIC')), 'error');
 
             $this->setRedirect(
                 Route::_(
@@ -467,7 +477,8 @@ class InvoicetemplateController extends FormController
             $app->setUserState($context . '.data', $validData);
 
             // Check-in failed, so go back to the record and display a notice.
-            $this->setMessage(Text::sprintf('JLIB_APPLICATION_ERROR_CHECKIN_FAILED', $model->getError()), 'error');
+            Log::add('invoicetemplate.save checkin failed: ' . $model->getError(), Log::ERROR, 'com_j2commerce');
+            $this->setMessage(Text::sprintf('JLIB_APPLICATION_ERROR_CHECKIN_FAILED', Text::_('COM_J2COMMERCE_ERR_GENERIC')), 'error');
 
             $this->setRedirect(
                 Route::_(

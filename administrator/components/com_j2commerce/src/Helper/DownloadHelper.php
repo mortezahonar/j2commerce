@@ -16,6 +16,7 @@ namespace J2Commerce\Component\J2commerce\Administrator\Helper;
 \defined('_JEXEC') or die;
 // phpcs:enable PSR1.Files.SideEffects
 
+use Joomla\CMS\Component\ComponentHelper;
 use Joomla\CMS\Factory;
 use Joomla\CMS\Language\Text;
 use Joomla\Database\DatabaseInterface;
@@ -209,37 +210,122 @@ final class DownloadHelper
     }
 
     /**
-     * Reset download access (re-grant with new expiry) for all downloads in an order.
+     * One row per downloadable file in an order, carrying the same availability rules the
+     * download endpoint enforces. Every surface that offers a link reads them from here, so
+     * an offered link and the endpoint that answers it can never disagree. The order-state
+     * half of that promise comes from allowedDownloadStatuses(), which the endpoint reads
+     * through isOrderStatusAllowed().
+     *
+     * @return  list<object>
      */
-    public static function resetDownloadAccess(string $orderId): void
+    public static function getOrderDownloads(string $orderId): array
     {
-        if (empty($orderId)) {
-            return;
+        if ($orderId === '') {
+            return [];
         }
 
-        $db       = Factory::getContainer()->get(DatabaseInterface::class);
-        $nullDate = $db->getNullDate();
-
-        // Reset access_granted to null so grantDownloads() will re-process them
+        $db    = Factory::getContainer()->get(DatabaseInterface::class);
         $query = $db->getQuery(true)
-            ->update($db->quoteName('#__j2commerce_orderdownloads'))
-            ->set($db->quoteName('access_granted') . ' = :nullDate')
-            ->set($db->quoteName('access_expires') . ' = :nullDate2')
-            ->where($db->quoteName('order_id') . ' = :orderId')
-            ->bind(':nullDate', $nullDate)
-            ->bind(':nullDate2', $nullDate)
-            ->bind(':orderId', $orderId);
+            ->select($db->quoteName([
+                'd.j2commerce_orderdownload_id',
+                'd.order_id',
+                'd.product_id',
+                'd.limit_count',
+                'd.access_granted',
+                'd.access_expires',
+                'f.j2commerce_productfile_id',
+                'f.product_file_display_name',
+                'f.product_file_save_name',
+            ]))
+            ->select($db->quoteName('p.params', 'product_params'))
+            ->from($db->quoteName('#__j2commerce_orderdownloads', 'd'))
+            ->join('INNER', $db->quoteName('#__j2commerce_productfiles', 'f')
+                . ' ON ' . $db->quoteName('f.product_id') . ' = ' . $db->quoteName('d.product_id'))
+            ->join('INNER', $db->quoteName('#__j2commerce_orders', 'o')
+                . ' ON ' . $db->quoteName('o.order_id') . ' = ' . $db->quoteName('d.order_id'))
+            ->join('LEFT', $db->quoteName('#__j2commerce_products', 'p')
+                . ' ON ' . $db->quoteName('p.j2commerce_product_id') . ' = ' . $db->quoteName('d.product_id'))
+            ->where($db->quoteName('d.order_id') . ' = :orderId')
+            ->bind(':orderId', $orderId)
+            ->order($db->quoteName('f.j2commerce_productfile_id') . ' ASC');
+
+        // Same order-status gate the account Downloads list applies, so a link is never
+        // offered for an order the endpoint would refuse to serve.
+        $statusIds = self::allowedDownloadStatuses();
+
+        if ($statusIds !== []) {
+            $placeholders = [];
+
+            // bind() takes its value by reference, so each placeholder must name its own
+            // array slot rather than a loop variable every iteration would overwrite.
+            foreach (array_keys($statusIds) as $i) {
+                $placeholders[] = ':dlStatus' . $i;
+                $query->bind(':dlStatus' . $i, $statusIds[$i], ParameterType::INTEGER);
+            }
+
+            $query->where($db->quoteName('o.order_state_id') . ' IN (' . implode(',', $placeholders) . ')');
+        }
 
         $db->setQuery($query);
-        $db->execute();
+        $rows = $db->loadObjectList() ?: [];
 
-        // Re-grant with fresh dates
-        self::grantDownloads($orderId);
+        $nullDate = $db->getNullDate();
+        $now      = time();
 
-        OrderHistoryHelper::add(
-            orderId: $orderId,
-            comment: Text::_('COM_J2COMMERCE_ORDER_DOWNLOAD_ACCESS_RESET'),
-        );
+        foreach ($rows as $row) {
+            $granted = (string) ($row->access_granted ?? '');
+            $expires = (string) ($row->access_expires ?? '');
+
+            $row->pending = $granted === '' || $granted === $nullDate || $granted === '0000-00-00 00:00:00';
+            $row->expired = !$row->pending
+                && $expires !== '' && $expires !== $nullDate && $expires !== '0000-00-00 00:00:00'
+                && strtotime($expires) < $now;
+
+            $limit      = empty($row->product_params)
+                ? 0
+                : (int) (new Registry($row->product_params))->get('download_limit', 0);
+            $limitCount = (int) ($row->limit_count ?? 0);
+
+            $row->limit_reached = $limit > 0 && $limitCount >= $limit;
+            $row->remaining     = $limit > 0 ? max(0, $limit - $limitCount) : -1;
+            $row->can_download  = !$row->pending && !$row->expired && !$row->limit_reached
+                && !empty($row->product_file_save_name);
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Whether an order in this state is inside the `limit_orderstatuses` window.
+     * The download endpoint asks this before serving so it applies the same predicate
+     * getOrderDownloads() filters the listing on.
+     */
+    public static function isOrderStatusAllowed(int $orderStateId): bool
+    {
+        $statusIds = self::allowedDownloadStatuses();
+
+        return $statusIds === [] || \in_array($orderStateId, $statusIds, true);
+    }
+
+    /**
+     * Order states downloads are released in, from `limit_orderstatuses`.
+     * An empty list means the setting places no restriction.
+     *
+     * @return  list<int>
+     */
+    private static function allowedDownloadStatuses(): array
+    {
+        $configured = ComponentHelper::getParams('com_j2commerce')->get('limit_orderstatuses', '');
+
+        if (empty($configured)) {
+            return [];
+        }
+
+        $statusIds = \is_array($configured)
+            ? array_map('intval', $configured)
+            : array_map('intval', explode(',', (string) $configured));
+
+        return array_values(array_filter($statusIds, static fn (int $id): bool => $id > 0));
     }
 
     /**
@@ -293,7 +379,7 @@ final class DownloadHelper
         );
 
         $attach = $segments === [] || \in_array('..', $segments, true)
-            ? AttachmentDenyFileHelper::DEFAULT_PATH
+            ? AttachmentDenyFileHelper::defaultPath()
             : implode('/', $segments);
 
         foreach (array_unique([$attach, 'images']) as $root) {
@@ -368,5 +454,213 @@ final class DownloadHelper
         }
 
         return false;
+    }
+
+    /**
+     * Deny direct web access to stored downloadable files, one rule set per directory.
+     *
+     * The attachment root is denied wholesale by the installer, but 'images' is an allowed
+     * download root too, and the Files tab defaults its upload folder to the first
+     * configured image directory — so a download routinely lands in the very directory the
+     * storefront serves its product images from. The rules therefore name the files
+     * individually rather than denying the tree, which is what lets a shared directory be
+     * covered at all. Reads are unaffected: the endpoint streams the file through PHP and
+     * never over HTTP.
+     *
+     * @param   list<string>  $storedPaths  Site-relative stored paths.
+     *
+     * @since  6.6.0
+     */
+    public static function protectStoredFiles(array $storedPaths, ?callable $trace = null): void
+    {
+        $byDir = [];
+
+        foreach ($storedPaths as $storedPath) {
+            if ($resolved = self::resolveStoredFile((string) $storedPath)) {
+                $byDir[$resolved[0]][$resolved[1]] = $resolved[1];
+            }
+        }
+
+        if ($byDir === []) {
+            return;
+        }
+
+        $recorded = self::recordedFilePaths();
+
+        if ($recorded === null) {
+            AttachmentDenyFileHelper::warn(
+                $trace,
+                'left the existing rules in place: the recorded file list could not be read',
+                'The list of stored downloadable files could not be read, so the rules in '
+                    . implode(', ', array_keys($byDir)) . ' were left as they are. Rewriting them from '
+                    . 'this save alone would have dropped the other downloads they name.'
+            );
+
+            return;
+        }
+
+        // A rule file names every downloadable file in its directory, so one built from
+        // this save alone would drop the siblings already recorded beside them.
+        foreach ($recorded as $recordedPath) {
+            $resolved = self::resolveStoredFile($recordedPath);
+
+            if ($resolved !== null && isset($byDir[$resolved[0]])) {
+                $byDir[$resolved[0]][$resolved[1]] = $resolved[1];
+            }
+        }
+
+        foreach ($byDir as $dir => $names) {
+            AttachmentDenyFileHelper::writeDownloadFileDeny($dir, array_values($names), $trace);
+        }
+    }
+
+    /**
+     * Cover every file already recorded, for directories that predate the save-side write.
+     *
+     * @since  6.6.0
+     */
+    public static function protectRecordedFiles(?callable $trace = null): void
+    {
+        $recorded = self::recordedFilePaths();
+
+        if ($recorded === null) {
+            AttachmentDenyFileHelper::warn(
+                $trace,
+                'stored downloadable files were not checked: the recorded file list could not be read',
+                'The list of stored downloadable files could not be read, so this run did not check that '
+                    . 'they are denied direct web access.'
+            );
+
+            return;
+        }
+
+        self::protectStoredFiles($recorded, $trace);
+    }
+
+    /**
+     * Rebuild the rules of the directories rows just deleted were stored in, so a name the
+     * component no longer records stops being named in them, and a directory left holding no
+     * recorded download loses the rule files this component put there rather than keeping
+     * them for good.
+     *
+     * A removed row does not remove the file from disk, so a name dropped here is a file
+     * that goes back to being served — the same outcome the next save in that directory
+     * already produced, arrived at when the row went rather than whenever something else
+     * happened to rewrite it.
+     *
+     * @param   list<string>  $removedPaths  Site-relative stored paths of the rows just deleted.
+     *
+     * @since  6.6.0
+     */
+    public static function releaseStoredFiles(array $removedPaths, ?callable $trace = null): void
+    {
+        $dirs = [];
+
+        foreach ($removedPaths as $removedPath) {
+            if ($dir = self::resolveStoredDir((string) $removedPath)) {
+                $dirs[$dir] = $dir;
+            }
+        }
+
+        if ($dirs === []) {
+            return;
+        }
+
+        $recorded = self::recordedFilePaths();
+
+        if ($recorded === null) {
+            AttachmentDenyFileHelper::warn(
+                $trace,
+                'left the existing rules in place: the recorded file list could not be read',
+                'The list of stored downloadable files could not be read, so the rules in '
+                    . implode(', ', $dirs) . ' still name a file that is no longer stored.'
+            );
+
+            return;
+        }
+
+        $byDir = [];
+
+        foreach ($recorded as $recordedPath) {
+            if ($resolved = self::resolveStoredFile($recordedPath)) {
+                $byDir[$resolved[0]][$resolved[1]] = $resolved[1];
+            }
+        }
+
+        foreach ($dirs as $dir) {
+            if (isset($byDir[$dir])) {
+                AttachmentDenyFileHelper::writeDownloadFileDeny($dir, array_values($byDir[$dir]), $trace);
+
+                continue;
+            }
+
+            AttachmentDenyFileHelper::removeDownloadFileDeny($dir, $trace);
+        }
+    }
+
+    /**
+     * The directory of a stored path, for a row whose file may already be gone.
+     *
+     * @return  string|null  Absolute directory, or null when it sits under no allowed root.
+     */
+    private static function resolveStoredDir(string $storedPath): ?string
+    {
+        if ($storedPath === '' || preg_match('#^[a-z][a-z0-9+.-]*://#i', $storedPath)) {
+            return null;
+        }
+
+        $dir = @realpath(\dirname(JPATH_SITE . '/' . str_replace('\\', '/', $storedPath)));
+
+        if ($dir === false || !is_dir($dir)) {
+            return null;
+        }
+
+        // isAllowedResolvedPath() judges a file inside a root, so it is asked about the rule
+        // file this directory would carry rather than about the directory itself.
+        return self::isAllowedResolvedPath($dir . \DIRECTORY_SEPARATOR . '.htaccess') ? $dir : null;
+    }
+
+    /**
+     * @return  array{0: string, 1: string}|null  Absolute directory and file name, or null
+     *                                            when the path names no local file under an allowed root.
+     */
+    private static function resolveStoredFile(string $storedPath): ?array
+    {
+        // A scheme URI is delivered by a plugin, not read off local disk.
+        if ($storedPath === '' || preg_match('#^[a-z][a-z0-9+.-]*://#i', $storedPath)) {
+            return null;
+        }
+
+        $realFile = @realpath(JPATH_SITE . '/' . str_replace('\\', '/', $storedPath));
+
+        if ($realFile === false || !is_file($realFile) || !self::isAllowedResolvedPath($realFile)) {
+            return null;
+        }
+
+        return [\dirname($realFile), basename($realFile)];
+    }
+
+    /**
+     * @return  list<string>|null  Null when the rows could not be read, which is not the
+     *                             same answer as none being recorded: a rule file names
+     *                             every download in its directory, so an empty list read
+     *                             off a failure would rewrite a wide ruleset as a narrow one.
+     */
+    private static function recordedFilePaths(): ?array
+    {
+        $db = Factory::getContainer()->get(DatabaseInterface::class);
+
+        try {
+            $query = $db->getQuery(true)
+                ->select('DISTINCT ' . $db->quoteName('product_file_save_name'))
+                ->from($db->quoteName('#__j2commerce_productfiles'));
+
+            $db->setQuery($query);
+
+            return array_map('strval', $db->loadColumn() ?: []);
+        } catch (\Throwable) {
+            // The table does not exist yet during a first install, and no caller may die here.
+            return null;
+        }
     }
 }

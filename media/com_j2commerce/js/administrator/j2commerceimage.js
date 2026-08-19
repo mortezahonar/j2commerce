@@ -198,8 +198,11 @@
             if (addFilesEl) {
                 const inner = addFilesEl.querySelector('.uppy-Dashboard-AddFiles-title');
                 if (inner) {
-                    inner.replaceChildren(document.createRange().createContextualFragment(`<span class="uppymedia-uppy-btn"><span class="fa-solid fa-images" aria-hidden="true"></span> ${this.escapeHtml(this.getText('COM_J2COMMERCE_MULTIIMAGEUPLOADER_ADD_PRODUCT_IMAGES'))}</span>`
-                        + `<p class="uppymedia-uppy-hint">${this.escapeHtml(this.getText('COM_J2COMMERCE_MULTIIMAGEUPLOADER_DRAG_DROP_NOTE'))}</p>`));
+                    inner.replaceChildren(...this.addFilesPrompt(
+                        'fa-solid fa-images',
+                        this.getText('COM_J2COMMERCE_MULTIIMAGEUPLOADER_ADD_PRODUCT_IMAGES'),
+                        this.getText('COM_J2COMMERCE_MULTIIMAGEUPLOADER_DRAG_DROP_NOTE')
+                    ));
                 }
                 // Wire browse button to Uppy's hidden file input
                 const browseSpan = addFilesEl.querySelector('.uppymedia-uppy-btn');
@@ -350,14 +353,32 @@
             const previewStyle = this.options.previewStyle || 'square';
             const isEditable = !this.element.hasAttribute('disabled') && !this.element.hasAttribute('readonly');
 
-            container.replaceChildren(document.createRange().createContextualFragment(this.selectedPaths.map(path => `
-                <div class="j2commerce-image-thumb ${previewStyle === 'contain' ? 'preview-contain' : ''}" data-path="${this.escapeHtml(path)}">
-                    <img src="${this.escapeHtml(this.resolveImageUrl(path))}" alt="" loading="lazy">
-                    ${isEditable ? `<button type="button" class="j2commerce-image-remove" aria-label="${this.getText('JACTION_DELETE')}">
-                        <span class="fa-solid fa-xmark" aria-hidden="true"></span>
-                    </button>` : ''}
-                </div>
-            `).join('')));
+            container.replaceChildren(...this.selectedPaths.map(path => {
+                const thumb = document.createElement('div');
+                thumb.className = 'j2commerce-image-thumb' + (previewStyle === 'contain' ? ' preview-contain' : '');
+                thumb.dataset.path = path;
+
+                const img = document.createElement('img');
+                img.src = this.resolveImageUrl(path);
+                img.alt = '';
+                img.loading = 'lazy';
+                thumb.appendChild(img);
+
+                if (isEditable) {
+                    const icon = document.createElement('span');
+                    icon.className = 'fa-solid fa-xmark';
+                    icon.setAttribute('aria-hidden', 'true');
+
+                    const remove = document.createElement('button');
+                    remove.type = 'button';
+                    remove.className = 'j2commerce-image-remove';
+                    remove.setAttribute('aria-label', this.getText('JACTION_DELETE'));
+                    remove.appendChild(icon);
+                    thumb.appendChild(remove);
+                }
+
+                return thumb;
+            }));
         }
 
         updateChooseButton() {
@@ -447,11 +468,11 @@
                     this.renderBrowserGrid(data.data.folders || [], data.data.files || []);
                     if (this.uppy) this.uppy.setMeta({ path: this.currentFolder });
                 } else {
-                    grid.replaceChildren(document.createRange().createContextualFragment(`<div class="text-center text-body-secondary p-3" style="grid-column:1/-1">${this.escapeHtml(data.message || 'Error loading folder')}</div>`));
+                    grid.replaceChildren(this.gridMessage(data.message || 'Error loading folder'));
                 }
             } catch {
                 if (loading) loading.classList.add('d-none');
-                grid.replaceChildren(document.createRange().createContextualFragment('<div class="text-center text-danger p-3" style="grid-column:1/-1">Failed to load images</div>'));
+                grid.replaceChildren(this.gridMessage('Failed to load images', 'text-danger'));
             }
         }
 
@@ -465,10 +486,7 @@
 
                 const folderEl = document.createElement('div');
                 folderEl.className = 'uppymedia-browser-folder';
-                folderEl.replaceChildren(document.createRange().createContextualFragment(`
-                    <span class="fa-solid fa-folder-open" aria-hidden="true"></span>
-                    <span class="uppymedia-folder-name">${this.escapeHtml(folderName)}</span>
-                `));
+                folderEl.replaceChildren(...this.folderTile(folderName));
 
                 folderEl.addEventListener('click', () => {
                     const newPath = this.currentFolder + '/' + folderName;
@@ -501,11 +519,7 @@
                     imageEl.classList.add('selected');
                 }
 
-                imageEl.replaceChildren(document.createRange().createContextualFragment(`
-                    <img src="${this.escapeHtml(file.thumb_url || file.url)}" alt="${this.escapeHtml(file.name)}" loading="lazy">
-                    <div class="uppymedia-check"></div>
-                    <div class="uppymedia-browser-name">${this.escapeHtml(file.name)}</div>
-                `));
+                imageEl.replaceChildren(...this.imageTile(file));
 
                 imageEl.addEventListener('click', () => {
                     if (!this.multiple) {
@@ -535,7 +549,7 @@
             });
 
             if (folders.length === 0 && files.length === 0) {
-                grid.replaceChildren(document.createRange().createContextualFragment('<div class="text-center text-body-secondary p-3" style="grid-column:1/-1">No images in this folder</div>'));
+                grid.replaceChildren(this.gridMessage('No images in this folder'));
             }
         }
 
@@ -553,11 +567,7 @@
             imageEl.dataset.thumbUrl = file.thumb_url || file.url;
             imageEl.dataset.name = file.name;
 
-            imageEl.replaceChildren(document.createRange().createContextualFragment(`
-                <img src="${this.escapeHtml(file.thumb_url || file.url)}" alt="${this.escapeHtml(file.name)}" loading="lazy">
-                <div class="uppymedia-check"></div>
-                <div class="uppymedia-browser-name">${this.escapeHtml(file.name)}</div>
-            `));
+            imageEl.replaceChildren(...this.imageTile(file));
 
             this.browserSelections.add(file.path);
 
@@ -619,11 +629,57 @@
             return this.siteRoot + path.replace(/^\/+/, '');
         }
 
-        escapeHtml(text) {
-            return String(text || '').replace(/[&<>"']/g, c => ({
-                '&': '&amp;', '<': '&lt;', '>': '&gt;',
-                '"': '&quot;', "'": '&#039;'
-            })[c]);
+        imageTile(file) {
+            const img = document.createElement('img');
+            img.src = file.thumb_url || file.url;
+            img.alt = file.name;
+            img.loading = 'lazy';
+
+            const check = document.createElement('div');
+            check.className = 'uppymedia-check';
+
+            const name = document.createElement('div');
+            name.className = 'uppymedia-browser-name';
+            name.textContent = file.name;
+
+            return [img, check, name];
+        }
+
+        folderTile(folderName) {
+            const icon = document.createElement('span');
+            icon.className = 'fa-solid fa-folder-open';
+            icon.setAttribute('aria-hidden', 'true');
+
+            const name = document.createElement('span');
+            name.className = 'uppymedia-folder-name';
+            name.textContent = folderName;
+
+            return [icon, name];
+        }
+
+        gridMessage(text, className = 'text-body-secondary') {
+            const message = document.createElement('div');
+            message.className = `text-center ${className} p-3`;
+            message.style.gridColumn = '1/-1';
+            message.textContent = text;
+
+            return message;
+        }
+
+        addFilesPrompt(iconClass, label, hint) {
+            const button = document.createElement('span');
+            button.className = 'uppymedia-uppy-btn';
+
+            const icon = document.createElement('span');
+            icon.className = iconClass;
+            icon.setAttribute('aria-hidden', 'true');
+            button.append(icon, ' ' + label);
+
+            const note = document.createElement('p');
+            note.className = 'uppymedia-uppy-hint';
+            note.textContent = hint;
+
+            return [button, note];
         }
 
         getText(key) {

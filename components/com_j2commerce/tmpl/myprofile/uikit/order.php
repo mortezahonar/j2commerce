@@ -58,11 +58,11 @@ $statusName = !empty($order->orderstatus_name) ? Text::_($order->orderstatus_nam
         </a>
         <div>
             <button type="button" class="uk-button uk-button-small uk-button-default j2commerce-order-print" data-url="<?php echo Route::_('index.php?option=com_j2commerce&view=myprofile&layout=order&order_id=' . urlencode($order->order_id) . '&tmpl=component'); ?>">
-                <span class="icon-print" aria-hidden="true"></span> <?php echo Text::_('COM_J2COMMERCE_ORDER_PRINT'); ?>
+                <span uk-icon="icon: print" aria-hidden="true"></span> <?php echo Text::_('COM_J2COMMERCE_ORDER_PRINT'); ?>
             </button>
             <?php if ($params->get('show_packingslip', 0)): ?>
                 <button type="button" class="uk-button uk-button-small uk-button-default j2commerce-packingslip-print uk-margin-small-left" data-url="<?php echo Route::_('index.php?option=com_j2commerce&view=myprofile&layout=packingslip&order_id=' . urlencode($order->order_id) . '&tmpl=component'); ?>">
-                    <span class="icon-box" aria-hidden="true"></span> <?php echo Text::_('COM_J2COMMERCE_ORDER_PRINT_PACKING_SLIP'); ?>
+                    <span uk-icon="icon: file-text" aria-hidden="true"></span> <?php echo Text::_('COM_J2COMMERCE_ORDER_PRINT_PACKING_SLIP'); ?>
                 </button>
             <?php endif; ?>
         </div>
@@ -369,6 +369,14 @@ $statusName = !empty($order->orderstatus_name) ? Text::_($order->orderstatus_nam
         </div>
     </div>
     <?php endif; ?>
+
+    <?php if (!$isPrint): ?>
+        <?php echo LayoutHelper::render('download.list', [
+            'downloads'  => $this->downloads,
+            'framework'  => 'uikit',
+            'dateFormat' => $dateFormat,
+        ], JPATH_ROOT . '/components/com_j2commerce/layouts'); ?>
+    <?php endif; ?>
 </div>
 
 <?php if (!$isPrint): ?>
@@ -387,7 +395,7 @@ $statusName = !empty($order->orderstatus_name) ? Text::_($order->orderstatus_nam
         <div class="uk-modal-footer uk-text-right">
             <button type="button" class="uk-button uk-button-default uk-modal-close"><?php echo Text::_('JCLOSE'); ?></button>
             <button type="button" class="uk-button uk-button-primary" id="j2commerceOrderPrintBtn">
-                <span class="icon-print" aria-hidden="true"></span> <?php echo Text::_('COM_J2COMMERCE_ORDER_PRINT'); ?>
+                <span uk-icon="icon: print" aria-hidden="true"></span> <?php echo Text::_('COM_J2COMMERCE_ORDER_PRINT'); ?>
             </button>
         </div>
     </div>

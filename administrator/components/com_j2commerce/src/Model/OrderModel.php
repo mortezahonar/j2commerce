@@ -32,6 +32,7 @@ use Joomla\CMS\Access\Access;
 use Joomla\CMS\Component\ComponentHelper;
 use Joomla\CMS\Factory;
 use Joomla\CMS\Form\Form;
+use Joomla\CMS\Language\LanguageHelper;
 use Joomla\CMS\Language\Text;
 use Joomla\CMS\Log\Log;
 use Joomla\CMS\Mail\Mail;
@@ -191,9 +192,10 @@ class OrderModel extends AdminModel
                 throw new \RuntimeException(Text::_('COM_J2COMMERCE_ERROR_GUEST_EMAIL_REQUIRED'));
             }
 
-            $customerId    = 0;
-            $customerEmail = $email;
-            $customerGroup = (string) (int) ComponentHelper::getParams('com_users')->get('guest_usergroup', 1);
+            $customerId       = 0;
+            $customerEmail    = $email;
+            $customerGroup    = (string) (int) ComponentHelper::getParams('com_users')->get('guest_usergroup', 1);
+            $customerLanguage = '';
         } else {
             $customerId = (int) ($data['user_id'] ?? 0);
 
@@ -207,8 +209,16 @@ class OrderModel extends AdminModel
                 throw new \RuntimeException(Text::_('COM_J2COMMERCE_ERROR_CUSTOMER_REQUIRED'));
             }
 
-            $customerEmail = (string) $customer->email;
-            $customerGroup = implode(',', Access::getGroupsByUser($customerId, false));
+            $customerEmail    = (string) $customer->email;
+            $customerGroup    = implode(',', Access::getGroupsByUser($customerId, false));
+            $customerLanguage = (string) $customer->getParam('language', '');
+        }
+
+        // The order records the language the CUSTOMER reads it back in. Taking the current
+        // request's tag would stamp the backend operator's locale onto someone else's order,
+        // and every notification about it would then go out in the wrong language.
+        if ($customerLanguage === '' || !LanguageHelper::exists($customerLanguage)) {
+            $customerLanguage = EmailHelper::siteDefaultLanguage();
         }
 
         $currencyCode  = ConfigHelper::getDefaultCurrency();
@@ -225,7 +235,7 @@ class OrderModel extends AdminModel
             'currency_id'       => CurrencyHelper::getId($currencyCode),
             'currency_value'    => 1,
             'invoice_prefix'    => $invoicePrefix,
-            'customer_language' => $app->getLanguage()->getTag(),
+            'customer_language' => $customerLanguage,
             'customer_note'     => (string) ($data['customer_note'] ?? ''),
             'customer_group'    => $customerGroup,
             'ip_address'        => '',
@@ -532,8 +542,46 @@ class OrderModel extends AdminModel
         }
 
         $this->enrichItemStock($items);
+        $this->enrichItemArticles($items);
 
         return $items;
+    }
+
+    /**
+     * Attach the linked com_content article id to each order item (one batched query, no N+1).
+     * Items whose product row is gone, is not sourced from com_content, or carries no source id
+     * resolve to 0 so the caller renders them without a link.
+     */
+    private function enrichItemArticles(array $items): void
+    {
+        $productIds = array_values(array_unique(array_filter(array_map(
+            static fn ($it): int => (int) ($it->product_id ?? 0),
+            $items
+        ))));
+
+        $map = [];
+
+        if (!empty($productIds)) {
+            $contentOption = 'com_content';
+            $db            = $this->getDatabase();
+            $query         = $db->getQuery(true)
+                ->select($db->quoteName(['j2commerce_product_id', 'product_source_id']))
+                ->from($db->quoteName('#__j2commerce_products'))
+                ->whereIn($db->quoteName('j2commerce_product_id'), $productIds, ParameterType::INTEGER)
+                ->where($db->quoteName('product_source') . ' = :source')
+                ->where($db->quoteName('product_source_id') . ' > 0')
+                ->bind(':source', $contentOption, ParameterType::STRING);
+
+            $db->setQuery($query);
+
+            foreach ($db->loadObjectList() ?: [] as $row) {
+                $map[(int) $row->j2commerce_product_id] = (int) $row->product_source_id;
+            }
+        }
+
+        foreach ($items as $item) {
+            $item->article_id = $map[(int) ($item->product_id ?? 0)] ?? 0;
+        }
     }
 
     /** Attach live stock_quantity + manages_stock to each order item (one batched query, no N+1). */
@@ -2430,8 +2478,15 @@ class OrderModel extends AdminModel
         $this->getDatabase()->insertObject('#__j2commerce_orderdiscounts', $row, 'j2commerce_orderdiscount_id');
     }
 
-    /** Resync orders.order_discount with the sum of the orderdiscounts rows. */
-    private function syncOrderDiscountTotal(string $orderId): void
+    /**
+     * Resync orders.order_discount with the sum of the orderdiscounts rows.
+     *
+     * Public because checkout calls it too: CartOrder::saveOrder() writes one row per
+     * discount code but only ever knew the coupon/voucher half of the column, so a
+     * plugin cart-discount left it at 0 and every later recalculateOrderTotals() rebuilt
+     * the total without it. The rows are the record; this column mirrors them.
+     */
+    public function syncOrderDiscountTotal(string $orderId): void
     {
         $db    = $this->getDatabase();
         $query = $db->getQuery(true)
@@ -2442,6 +2497,9 @@ class OrderModel extends AdminModel
         $db->setQuery($query);
         $total = number_format((float) $db->loadResult(), 5, '.', '');
 
+        // order_discount_tax is deliberately left alone. It has no core reader, but two shipped
+        // extensions fold it into a discount base, and it has been NULL on every checkout order —
+        // populating it here would move renewal pricing and vendor commission without warning.
         $update = $db->getQuery(true)
             ->update($db->quoteName('#__j2commerce_orders'))
             ->set($db->quoteName('order_discount') . ' = :total')
@@ -2590,14 +2648,21 @@ class OrderModel extends AdminModel
             $db->insertObject('#__j2commerce_ordertaxes', $row, 'j2commerce_ordertax_id');
         }
 
-        return $this->recalculateOrderTotals($orderId);
+        // Every line above was rewritten, zeros included, so the sum is this order's tax even
+        // when it comes to nothing — an order recomputed into a geozone that taxes none of it
+        // has to be able to reach zero.
+        return $this->recalculateOrderTotals($orderId, true);
     }
 
     /**
      * Recalculate and persist order totals from the current line items,
      * shipping, fees, surcharge and discounts. Returns the stored totals.
+     *
+     * @param  bool  $itemTaxIsAuthoritative  The caller has just written orderitem_tax for every
+     *                                        line, so an all-zero sum is recorded data rather than
+     *                                        an absent value. See the tax note below.
      */
-    public function recalculateOrderTotals(string $orderId): array
+    public function recalculateOrderTotals(string $orderId, bool $itemTaxIsAuthoritative = false): array
     {
         $db = $this->getDatabase();
 
@@ -2643,6 +2708,7 @@ class OrderModel extends AdminModel
                 'order_credit',
                 'order_tax',
                 'is_including_tax',
+                'currency_code',
             ]))
             ->from($db->quoteName('#__j2commerce_orders'))
             ->where($db->quoteName('order_id') . ' = :orderId')
@@ -2654,7 +2720,13 @@ class OrderModel extends AdminModel
             return [];
         }
 
-        $subtotal    = round((float) ($itemTotals->subtotal ?? 0), 2);
+        // The order's own currency decides the precision, not a hardcoded two places: a
+        // 0-decimal currency (JPY) rebuilt at 2dp reintroduces the fractions checkout had
+        // already settled, and a 3-decimal one (BHD, KWD) loses a digit of a real charge.
+        // This is the same scale CartOrder::quantizeTotals() used when the order was placed,
+        // so an admin recalculation lands on the figure the shopper was charged.
+        $scale       = CurrencyHelper::getDecimalPlace((string) ($order->currency_code ?? ''));
+        $subtotal    = round((float) ($itemTotals->subtotal ?? 0), $scale);
         // Same authoritative-store question the fee component answers below. orderitem_tax is
         // written only by recomputeOrderTax(), which checkout never calls, so an order placed
         // through the storefront can carry its item tax solely in orders.order_tax with every
@@ -2665,15 +2737,19 @@ class OrderModel extends AdminModel
         // also carries the shipping tax, which $shippingTax adds separately, so it would
         // double-count it.
         //
-        // Known limit: "no per-line tax was ever recorded" and "per-line tax is genuinely zero"
-        // are indistinguishable in the data, so removing every taxable line from such an order
-        // leaves the stored tax standing. Accepted deliberately — it errs toward preserving a
-        // real charge rather than destroying it, and only legacy orders reach this branch;
-        // checkout now populates the per-line column, which makes the sum authoritative again.
-        $itemTaxSum  = round((float) ($itemTotals->tax ?? 0), 2);
-        $tax         = $itemTaxSum > 0 ? $itemTaxSum : round((float) $order->order_tax, 2);
-        $shipping    = round((float) ($shippingTotals->shipping ?? 0), 2);
-        $shippingTax = round((float) ($shippingTotals->shipping_tax ?? 0), 2);
+        // The stored value cannot answer that question on its own: orderitem_tax is NOT NULL and
+        // legacy rows hold 0.00000 rather than NULL, so "never recorded" and "genuinely zero"
+        // read identically. Inferring it from the sum therefore errs toward preserving a real
+        // charge — which in turn leaves a caller that has deliberately recalculated the tax down
+        // to zero with no way to record that. $itemTaxIsAuthoritative is that way: a caller that
+        // has just written every line's tax takes the sum whatever it is. The inference stays the
+        // default for the legacy paths that still rely on it.
+        $itemTaxSum  = round((float) ($itemTotals->tax ?? 0), $scale);
+        $tax         = ($itemTaxIsAuthoritative || $itemTaxSum > 0)
+            ? $itemTaxSum
+            : round((float) $order->order_tax, $scale);
+        $shipping    = round((float) ($shippingTotals->shipping ?? 0), $scale);
+        $shippingTax = round((float) ($shippingTotals->shipping_tax ?? 0), $scale);
         // Re-cap the applied discount if items were removed/reduced after it was applied.
         $discount    = min((float) $order->order_discount, $subtotal);
         // order_surcharge and the #__j2commerce_orderfees rows are the same money, not two
@@ -2690,8 +2766,8 @@ class OrderModel extends AdminModel
         // (zero) row sum as authoritative there would drop a real charge off order_total and
         // then overwrite the one column that still remembered it.
         $feeRows      = (int) ($feeTotals->fee_rows ?? 0);
-        $fees         = round((float) ($feeTotals->fee_amount ?? 0) + (float) ($feeTotals->fee_tax ?? 0), 2);
-        $surcharge    = round((float) $order->order_surcharge, 2);
+        $fees         = round((float) ($feeTotals->fee_amount ?? 0) + (float) ($feeTotals->fee_tax ?? 0), $scale);
+        $surcharge    = round((float) $order->order_surcharge, $scale);
         $feeComponent = $feeRows > 0 ? $fees : $surcharge;
         $credit       = (float) $order->order_credit;
 
@@ -2700,10 +2776,10 @@ class OrderModel extends AdminModel
 
         $total = round(
             $subtotal + $itemTaxComponent + $shipping + $shippingTax + $feeComponent - $discount - $credit,
-            2
+            $scale
         );
 
-        $subtotalEx = ((int) $order->is_including_tax === 1) ? round($subtotal - $tax, 2) : $subtotal;
+        $subtotalEx = ((int) $order->is_including_tax === 1) ? round($subtotal - $tax, $scale) : $subtotal;
 
         $subtotalStr   = number_format($subtotal, 5, '.', '');
         $subtotalExStr = number_format($subtotalEx, 5, '.', '');
@@ -2755,9 +2831,9 @@ class OrderModel extends AdminModel
             'tax'          => $tax,
             'shipping'     => $shipping,
             'shipping_tax' => $shippingTax,
-            'discount'     => round($discount, 2),
+            'discount'     => round($discount, $scale),
             'surcharge'    => $feeRows > 0 ? 0.0 : $surcharge,
-            'fees'         => round($feeRows > 0 ? $fees : 0.0, 2),
+            'fees'         => round($feeRows > 0 ? $fees : 0.0, $scale),
             'total'        => max(0.0, $total),
         ];
     }

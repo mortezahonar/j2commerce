@@ -14,6 +14,7 @@ defined('_JEXEC') or die;
 use J2Commerce\Component\J2commerce\Administrator\Helper\CurrencyHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\J2CommerceHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\J2htmlHelper;
+use J2Commerce\Component\J2commerce\Administrator\Helper\OrderHelper;
 use J2Commerce\Plugin\System\J2Commerce\Helper\LeafletMapHelper;
 use Joomla\CMS\HTML\HTMLHelper;
 use Joomla\CMS\Language\Text;
@@ -38,8 +39,6 @@ $currencyValue = (float) ($order->currency_value ?? 1);
 $fmt = static function (float $amount) use ($currencyCode, $currencyValue): string {
     return CurrencyHelper::format($amount, $currencyCode, $currencyValue);
 };
-
-$checkoutPriceDisplay = (int) (J2CommerceHelper::config()->get('checkout_price_display_options', 0));
 
 $isCancelled = ($paction === 'cancel');
 
@@ -66,10 +65,10 @@ $tierCircleClass = match ($statusTier) {
     default   => 'j2c-cancel-circle',
 };
 $tierIcon = match ($statusTier) {
-    'success' => 'icon-check',
-    'pending' => 'icon-info-circle',
-    'failed'  => 'icon-warning',
-    default   => 'icon-times',
+    'success' => 'fa-solid fa-circle-check',
+    'pending' => 'fa-solid fa-circle-info',
+    'failed'  => 'fa-solid fa-triangle-exclamation',
+    default   => 'fa-solid fa-xmark',
 };
 $tierMessage = match ($statusTier) {
     'success'   => 'COM_J2COMMERCE_ORDER_CONFIRMED_MESSAGE',
@@ -205,7 +204,7 @@ if ($info) {
                     <?php if (!empty($order->user_email)) : ?>
                         <div class="j2c-block-email-updates card mb-4">
                             <div class="card-body d-flex align-items-center gap-3">
-                                <span class="icon-envelope text-body-secondary" style="font-size: 1.25rem;" aria-hidden="true"></span>
+                                <span class="fa-solid fa-envelope text-body-secondary" style="font-size: 1.25rem;" aria-hidden="true"></span>
                                 <div>
                                     <h3 class="h6 mb-1"><?php echo Text::_('COM_J2COMMERCE_ORDER_UPDATES'); ?></h3>
                                     <p class="text-body-secondary mb-0 small">
@@ -216,6 +215,21 @@ if ($info) {
                             </div>
                         </div>
                     <?php endif; ?>
+
+                    <?php // Article linked to the order's payment method ?>
+                    <?php if ($this->articleHtml !== '') : ?>
+                        <div class="j2c-block-article-content card mb-4">
+                            <div class="card-body">
+                                <?php echo $this->articleHtml; ?>
+                            </div>
+                        </div>
+                    <?php endif; ?>
+
+                    <?php echo LayoutHelper::render('download.list', [
+                        'downloads'  => $this->downloads,
+                        'framework'  => 'bootstrap5',
+                        'dateFormat' => $this->params->get('date_format', 'Y-m-d'),
+                    ], JPATH_ROOT . '/components/com_j2commerce/layouts'); ?>
 
                     <?php echo J2CommerceHelper::plugin()->eventWithHtml('BeforeConfirmationOrderDetails', array($this, $order, 'onJ2Commerce'))->getArgument('html', ''); ?>
 
@@ -267,7 +281,10 @@ if ($info) {
                                                 <?php if (!empty($info->shipping_address_2)) : ?>
                                                     <br><?php echo $this->escape($info->shipping_address_2); ?>
                                                 <?php endif; ?>
-                                                <br><?php echo $this->escape(trim(($info->shipping_city ?? '') . ', ' . ($info->shipping_zone_name ?? '') . ' ' . ($info->shipping_zip ?? ''))); ?>
+                                                <?php $shippingLocality = implode(', ', array_filter([$info->shipping_city ?? '', trim(($info->shipping_zone_name ?? '') . ' ' . ($info->shipping_zip ?? ''))], 'strlen')); ?>
+                                                <?php if ($shippingLocality !== '') : ?>
+                                                    <br><?php echo $this->escape($shippingLocality); ?>
+                                                <?php endif; ?>
                                                 <?php if (!empty($info->shipping_country_name)) : ?>
                                                     <br><?php echo $this->escape($info->shipping_country_name); ?>
                                                 <?php endif; ?>
@@ -291,7 +308,10 @@ if ($info) {
                                             <?php if (!empty($info->billing_address_2)) : ?>
                                                 <br><?php echo $this->escape($info->billing_address_2); ?>
                                             <?php endif; ?>
-                                            <br><?php echo $this->escape(trim(($info->billing_city ?? '') . ', ' . ($info->billing_zone_name ?? '') . ' ' . ($info->billing_zip ?? ''))); ?>
+                                            <?php $billingLocality = implode(', ', array_filter([$info->billing_city ?? '', trim(($info->billing_zone_name ?? '') . ' ' . ($info->billing_zip ?? ''))], 'strlen')); ?>
+                                            <?php if ($billingLocality !== '') : ?>
+                                                <br><?php echo $this->escape($billingLocality); ?>
+                                            <?php endif; ?>
                                             <?php if (!empty($info->billing_country_name)) : ?>
                                                 <br><?php echo $this->escape($info->billing_country_name); ?>
                                             <?php endif; ?>
@@ -396,7 +416,7 @@ if ($info) {
                                                  class="j2c-order-item-img rounded border" loading="lazy">
                                         <?php else : ?>
                                             <div class="j2c-item-placeholder rounded border d-flex align-items-center justify-content-center">
-                                                <span class="icon-image text-body-tertiary" aria-hidden="true"></span>
+                                                <span class="fa-solid fa-image text-body-tertiary" aria-hidden="true"></span>
                                             </div>
                                         <?php endif; ?>
                                         <?php if ($qty > 1) : ?>
@@ -436,8 +456,8 @@ if ($info) {
                             <?php foreach ($discounts as $disc) : ?>
                                 <?php if (!empty($disc->discount_code)) : ?>
                                     <span class="badge bg-dark text-white me-1 mb-1">
-                                        <span class="icon-tag me-1" aria-hidden="true"></span>
-                                        <?php echo $this->escape($disc->discount_code); ?>
+                                        <span class="fa-solid fa-tag me-1" aria-hidden="true"></span>
+                                        <?php echo $this->escape($disc->discount_title ?: $disc->discount_code); ?>
                                     </span>
                                 <?php endif; ?>
                             <?php endforeach; ?>
@@ -447,100 +467,18 @@ if ($info) {
                     <hr>
 
                     <?php
-                    // order_tax + order_shipping_tax are the columns order_total is computed from
-                    // (OrderModel::recalculateOrderTotals). #__j2commerce_ordertaxes supplies the
-                    // per-profile labels only — shipping tax is not always folded into its rows,
-                    // depending on the tax engine that created the order.
-                    $itemTax       = (float) ($order->order_tax ?? 0);
-                    $shippingTax   = (float) ($order->order_shipping_tax ?? 0);
-                    $orderTaxTotal = $itemTax + $shippingTax;
-                    $decimals      = CurrencyHelper::getDecimalPlace($currencyCode);
-
-                    // Tax-inclusive stores carry item tax inside order_subtotal — show the ex-tax
-                    // column so the Subtotal row plus the Tax row(s) don't double-count it.
-                    $displaySubtotal = (int) ($order->is_including_tax ?? 0) === 1
-                        ? (float) ($order->order_subtotal_ex_tax ?? ((float) $order->order_subtotal - $itemTax))
-                        : (float) $order->order_subtotal;
-
-                    $taxRows = [];
-                    if (!empty($taxes)) {
-                        $profileSum = 0.0;
-                        foreach ($taxes as $tax) {
-                            $profileSum += (float) ($tax->ordertax_amount ?? 0);
-                        }
-                        $taxRemainder = round($orderTaxTotal - $profileSum, $decimals);
-
-                        if ($taxRemainder >= 0) {
-                            foreach ($taxes as $tax) {
-                                $taxAmount = (float) ($tax->ordertax_amount ?? 0);
-                                if ($taxAmount <= 0) {
-                                    continue;
-                                }
-
-                                $taxTitle   = $tax->ordertax_title ?? Text::_('COM_J2COMMERCE_CART_TAX');
-                                $taxPercent = (float) ($tax->ordertax_percent ?? 0);
-
-                                if ($taxPercent > 0) {
-                                    $taxLabel = $checkoutPriceDisplay
-                                        ? Text::sprintf('COM_J2COMMERCE_CART_TAX_INCLUDED_TITLE', Text::_($taxTitle), $taxPercent . '%')
-                                        : Text::sprintf('COM_J2COMMERCE_CART_TAX_EXCLUDED_TITLE', Text::_($taxTitle), $taxPercent . '%');
-                                } else {
-                                    $taxLabel = Text::_($taxTitle);
-                                }
-
-                                $taxRows[] = ['label' => $taxLabel, 'amount' => $taxAmount];
-                            }
-
-                            if ($taxRemainder > 0) {
-                                // Shipping tax computed outside the itemized tax engine on this
-                                // order — show the gap so the rows keep summing to the total.
-                                $taxRows[] = ['label' => Text::_('COM_J2COMMERCE_ORDER_SHIPPING_TAX'), 'amount' => $taxRemainder];
-                            }
-                        }
-                    }
-
-                    if (empty($taxRows) && $orderTaxTotal > 0) {
-                        $taxRows[] = ['label' => Text::_('COM_J2COMMERCE_CART_TAX'), 'amount' => $orderTaxTotal];
-                    }
-
-                    // Self-check: the monetary rows printed below must foot to order_total at the
-                    // currency's display precision — fall back to a single derived Tax row rather
-                    // than show the customer a block that does not add up.
-                    $printedFees = 0.0;
-                    if (!empty($fees)) {
-                        foreach ($fees as $fee) {
-                            $feeAmount = (float) ($fee->amount ?? 0);
-                            if ($feeAmount > 0) {
-                                $printedFees += $feeAmount;
-                            }
-                        }
-                    } elseif ((float) ($order->order_surcharge ?? 0) > 0) {
-                        $printedFees = (float) $order->order_surcharge;
-                    }
-
-                    $printedDiscounts = 0.0;
-                    if (!empty($discounts)) {
-                        foreach ($discounts as $disc) {
-                            $discAmount = (float) ($disc->discount_amount ?? 0);
-                            if ($discAmount > 0) {
-                                $printedDiscounts += $discAmount;
-                            }
-                        }
-                    } elseif ((float) ($order->order_discount ?? 0) > 0) {
-                        $printedDiscounts = (float) $order->order_discount;
-                    }
-
-                    $nonTaxTotal = $displaySubtotal
-                        + ((int) $order->is_shippable ? (float) ($order->order_shipping ?? 0) : 0.0)
-                        + $printedFees
-                        - $printedDiscounts;
-
-                    if (round($nonTaxTotal + $orderTaxTotal, $decimals) !== round((float) ($order->order_total ?? 0), $decimals)) {
-                        $derivedTax = round((float) ($order->order_total ?? 0) - $nonTaxTotal, $decimals);
-                        $taxRows    = $derivedTax > 0
-                            ? [['label' => Text::_('COM_J2COMMERCE_CART_TAX'), 'amount' => $derivedTax]]
-                            : [];
-                    }
+                    // One builder answers for the checkout summary and for this page, so the rows, their
+                    // labels and the tax split are the ones the customer was quoted, and every figure
+                    // printed below foots to the total the order carries.
+                    $summaryRows = array_filter(
+                        OrderHelper::getFormattedOrderTotals($order, [
+                            'shippings' => $shippings,
+                            'taxes'     => $taxes,
+                            'fees'      => $fees,
+                            'discounts' => $discounts,
+                        ]),
+                        static fn (array $summaryRow): bool => $summaryRow['type'] !== 'grandtotal'
+                    );
                     ?>
 
                     <?php // Summary lines ?>
@@ -554,72 +492,10 @@ if ($info) {
                                 </div>
                             <?php endif; ?>
                         <?php endforeach; ?>
-                        <?php // Subtotal ?>
-                        <div class="d-flex justify-content-between mb-2">
-                            <span><?php echo Text::_('COM_J2COMMERCE_CART_SUBTOTAL'); ?></span>
-                            <span><?php echo $fmt($displaySubtotal); ?></span>
-                        </div>
-
-                        <?php // Shipping — show actual method name ?>
-                        <?php if ((int) $order->is_shippable) : ?>
-                            <?php
-                            $shippingLabel = Text::_('COM_J2COMMERCE_CART_SHIPPING');
-                            if (!empty($shippings)) {
-                                $firstShipping = reset($shippings);
-                                if (!empty($firstShipping->ordershipping_name)) {
-                                    $shippingLabel = Text::_(stripslashes($firstShipping->ordershipping_name));
-                                }
-                            }
-                            ?>
-                            <div class="d-flex justify-content-between mb-2">
-                                <span><?php echo $this->escape($shippingLabel); ?></span>
-                                <span><?php echo $fmt((float) $order->order_shipping); ?></span>
-                            </div>
-                        <?php endif; ?>
-
-                        <?php // Fees/Surcharges ?>
-                        <?php if (!empty($fees)) : ?>
-                            <?php foreach ($fees as $fee) : ?>
-                                <?php if ((float) ($fee->amount ?? 0) > 0) : ?>
-                                    <div class="d-flex justify-content-between mb-2">
-                                        <span><?php echo $this->escape($fee->name ?: Text::_('COM_J2COMMERCE_CART_SURCHARGE')); ?></span>
-                                        <span><?php echo $fmt((float) $fee->amount); ?></span>
-                                    </div>
-                                <?php endif; ?>
-                            <?php endforeach; ?>
-                        <?php elseif ((float) ($order->order_surcharge ?? 0) > 0) : ?>
-                            <div class="d-flex justify-content-between mb-2">
-                                <span><?php echo Text::_('COM_J2COMMERCE_CART_SURCHARGE'); ?></span>
-                                <span><?php echo $fmt((float) $order->order_surcharge); ?></span>
-                            </div>
-                        <?php endif; ?>
-
-                        <?php // Discounts — show each with coupon/voucher name ?>
-                        <?php if (!empty($discounts)) : ?>
-                            <?php foreach ($discounts as $disc) : ?>
-                                <?php $discountAmount = (float) ($disc->discount_amount ?? 0); ?>
-                                <?php if ($discountAmount > 0) : ?>
-                                    <?php
-                                    $discountLabel = $disc->discount_title ?? $disc->discount_code ?? Text::_('COM_J2COMMERCE_CART_DISCOUNT');
-                                    ?>
-                                    <div class="d-flex justify-content-between mb-2 text-success">
-                                        <span><?php echo $this->escape($discountLabel); ?></span>
-                                        <span>-<?php echo $fmt($discountAmount); ?></span>
-                                    </div>
-                                <?php endif; ?>
-                            <?php endforeach; ?>
-                        <?php elseif ((float) $order->order_discount > 0) : ?>
-                            <div class="d-flex justify-content-between mb-2 text-success">
-                                <span><?php echo Text::_('COM_J2COMMERCE_CART_DISCOUNT'); ?></span>
-                                <span>-<?php echo $fmt((float) $order->order_discount); ?></span>
-                            </div>
-                        <?php endif; ?>
-
-                        <?php // Tax lines — per-profile labels; any shipping tax not folded into them shows as its own row ?>
-                        <?php foreach ($taxRows as $taxRow) : ?>
-                            <div class="d-flex justify-content-between mb-2">
-                                <span><?php echo $this->escape($taxRow['label']); ?></span>
-                                <span><?php echo $fmt($taxRow['amount']); ?></span>
+                        <?php foreach ($summaryRows as $summaryRow) : ?>
+                            <div class="d-flex justify-content-between mb-2<?php echo $summaryRow['type'] === 'discount' ? ' text-success' : ''; ?>">
+                                <span><?php echo $this->escape($summaryRow['label']); ?></span>
+                                <span><?php echo $summaryRow['type'] === 'discount' ? '-' : ''; ?><?php echo $fmt($summaryRow['amount']); ?></span>
                             </div>
                         <?php endforeach; ?>
                     </div>

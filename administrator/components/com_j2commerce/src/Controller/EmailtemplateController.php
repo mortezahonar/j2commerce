@@ -15,7 +15,11 @@ namespace J2Commerce\Component\J2commerce\Administrator\Controller;
 use J2Commerce\Component\J2commerce\Administrator\Helper\EmailHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\MessageHelper;
 use Joomla\CMS\Event\GenericEvent;
+use Joomla\CMS\Factory;
 use Joomla\CMS\Language\Text;
+use Joomla\CMS\Log\Log;
+use Joomla\CMS\Mail\Exception\MailDisabledException;
+use Joomla\CMS\Mail\MailerFactoryInterface;
 use Joomla\CMS\MVC\Controller\FormController;
 use Joomla\CMS\MVC\Model\BaseDatabaseModel;
 use Joomla\CMS\Plugin\PluginHelper;
@@ -259,6 +263,10 @@ class EmailtemplateController extends FormController
     {
         Session::checkToken() or jexit(Text::_('JINVALID_TOKEN'));
 
+        if (!$this->app->getIdentity()->authorise('core.manage', 'com_j2commerce')) {
+            jexit(Text::_('JLIB_APPLICATION_ERROR_ACCESS_FORBIDDEN'));
+        }
+
         $body      = $this->input->post->getRaw('body', '');
         $subject   = $this->input->post->getString('subject', '');
         $customCss = $this->input->post->getRaw('custom_css', '');
@@ -283,8 +291,10 @@ class EmailtemplateController extends FormController
         $processedSubject = EmailHelper::processTypeTags($emailType, $context, $order, $subject);
 
         // Build full HTML with custom CSS
+        // Dropping '<' outright: a single pass at '</style' can be reassembled by a
+        // nested sequence, so the character the element cannot survive goes instead.
         $headStyles = '';
-        $customCss  = trim($customCss);
+        $customCss  = trim(str_replace('<', '', $customCss));
         if ($customCss !== '') {
             $headStyles = '<style type="text/css">' . $customCss . '</style>';
         }
@@ -306,12 +316,20 @@ class EmailtemplateController extends FormController
     {
         Session::checkToken() or jexit(Text::_('JINVALID_TOKEN'));
 
+        $user = $this->app->getIdentity();
+
+        if (!$user->authorise('core.manage', 'com_j2commerce')) {
+            jexit(Text::_('JLIB_APPLICATION_ERROR_ACCESS_FORBIDDEN'));
+        }
+
         $body      = $this->input->post->getRaw('body', '');
         $subject   = $this->input->post->getString('subject', '');
         $customCss = $this->input->post->getRaw('custom_css', '');
-        $recipient = $this->input->post->getString('recipient', '');
         $emailType = $this->input->post->getCmd('email_type', 'transactional');
         $context   = $this->input->post->getCmd('context', 'test');
+
+        // A test send goes to the account that asked for it, the way the diagnostics mail probe does.
+        $recipient = (string) $user->email;
 
         $json = ['success' => false, 'message' => ''];
 
@@ -323,6 +341,10 @@ class EmailtemplateController extends FormController
             return;
         }
 
+        // Built before the try so the transport is known even if sending throws.
+        $mailer    = Factory::getContainer()->get(MailerFactoryInterface::class)->createMailer();
+        $transport = $mailer->Mailer;
+
         try {
             $emailHelper = EmailHelper::getInstance();
             $order       = $emailHelper->getSampleOrderData();
@@ -332,7 +354,7 @@ class EmailtemplateController extends FormController
 
             // Build full HTML
             $headStyles = '';
-            $customCss  = trim($customCss);
+            $customCss  = trim(str_replace('<', '', $customCss));
             if ($customCss !== '') {
                 $headStyles = '<style type="text/css">' . $customCss . '</style>';
             }
@@ -344,8 +366,11 @@ class EmailtemplateController extends FormController
                 . '</head><body>' . $processedBody . '</body></html>';
 
             $config = $this->app->getConfig();
-            $mailer = \Joomla\CMS\Factory::getMailer();
-            $mailer->setSender([$config->get('mailfrom'), $config->get('fromname')]);
+
+            // Third element false leaves PHPMailer's Sender empty, so mail() is called
+            // without a -f envelope-sender argument. Mirrors MailTemplate, which core
+            // uses everywhere; hosts that refuse the envelope sender fail mail() outright.
+            $mailer->setSender([$config->get('mailfrom'), $config->get('fromname'), false]);
             $mailer->addRecipient($recipient);
             $mailer->setSubject('[TEST] ' . $processedSubject);
             $mailer->isHTML(true);
@@ -354,13 +379,22 @@ class EmailtemplateController extends FormController
             $mailer->setBody($htmlBody);
 
             if ($mailer->Send()) {
+                Log::add(
+                    'emailtemplate.sendTest sent via ' . $transport . ' by user ' . $user->id,
+                    Log::INFO,
+                    'com_j2commerce'
+                );
                 $json['success'] = true;
                 $json['message'] = Text::sprintf('COM_J2COMMERCE_EMAILTEMPLATE_TEST_SENT', $recipient);
             } else {
-                $json['message'] = Text::_('COM_J2COMMERCE_EMAILTEMPLATE_TEST_FAILED');
+                $json['message'] = Text::sprintf('COM_J2COMMERCE_EMAILTEMPLATE_TEST_FAILED_TRANSPORT', $transport);
             }
+        } catch (MailDisabledException $e) {
+            Log::add('emailtemplate.sendTest blocked: ' . $e->getMessage(), Log::WARNING, 'com_j2commerce');
+            $json['message'] = Text::_('JLIB_MAIL_FUNCTION_OFFLINE');
         } catch (\Throwable $e) {
-            $json['message'] = $e->getMessage();
+            Log::add('emailtemplate.sendTest failed via ' . $transport . ': ' . $e->getMessage(), Log::ERROR, 'com_j2commerce');
+            $json['message'] = Text::sprintf('COM_J2COMMERCE_EMAILTEMPLATE_TEST_FAILED_TRANSPORT', $transport);
         }
 
         header('Content-Type: application/json');
@@ -558,7 +592,8 @@ class EmailtemplateController extends FormController
             // Check-in the original row.
             if ($checkin && $model->checkin($data[$key]) === false) {
                 // Check-in failed. Go back to the item and display a notice.
-                $this->setMessage(Text::sprintf('JLIB_APPLICATION_ERROR_CHECKIN_FAILED', $model->getError()), 'error');
+                Log::add('emailtemplate.save2copy checkin failed: ' . $model->getError(), Log::ERROR, 'com_j2commerce');
+                $this->setMessage(Text::sprintf('JLIB_APPLICATION_ERROR_CHECKIN_FAILED', Text::_('COM_J2COMMERCE_ERR_GENERIC')), 'error');
 
                 $this->setRedirect(
                     Route::_(
@@ -593,7 +628,8 @@ class EmailtemplateController extends FormController
         $form = $model->getForm($data, false);
 
         if (!$form) {
-            $app->enqueueMessage($model->getError(), 'error');
+            Log::add('emailtemplate.getForm failed: ' . $model->getError(), Log::ERROR, 'com_j2commerce');
+            $app->enqueueMessage(Text::_('COM_J2COMMERCE_ERR_GENERIC'), 'error');
 
             return false;
         }
@@ -636,7 +672,8 @@ class EmailtemplateController extends FormController
             $app->setUserState($context . '.data', $validData);
 
             // Redirect back to the edit screen.
-            $this->setMessage(Text::sprintf('JLIB_APPLICATION_ERROR_SAVE_FAILED', $model->getError()), 'error');
+            Log::add('emailtemplate.save failed: ' . $model->getError(), Log::ERROR, 'com_j2commerce');
+            $this->setMessage(Text::sprintf('JLIB_APPLICATION_ERROR_SAVE_FAILED', Text::_('COM_J2COMMERCE_ERR_GENERIC')), 'error');
 
             $this->setRedirect(
                 Route::_(
@@ -655,7 +692,8 @@ class EmailtemplateController extends FormController
             $app->setUserState($context . '.data', $validData);
 
             // Check-in failed, so go back to the record and display a notice.
-            $this->setMessage(Text::sprintf('JLIB_APPLICATION_ERROR_CHECKIN_FAILED', $model->getError()), 'error');
+            Log::add('emailtemplate.save checkin failed: ' . $model->getError(), Log::ERROR, 'com_j2commerce');
+            $this->setMessage(Text::sprintf('JLIB_APPLICATION_ERROR_CHECKIN_FAILED', Text::_('COM_J2COMMERCE_ERR_GENERIC')), 'error');
 
             $this->setRedirect(
                 Route::_(

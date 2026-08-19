@@ -61,6 +61,12 @@ class ProductHelper
      */
     private static string $taxInfo = '';
 
+    /** Resolved once per request — a variant list asks for the same handful of ids on every row. */
+    private static array $optionValueNames = [];
+
+    /** Resolved once per request — see taxSuppressedUntilAddressKnown(). */
+    private static ?bool $taxSuppressed = null;
+
     /**
      * State object for instance-based operations
      *
@@ -749,7 +755,7 @@ class ProductHelper
             // Reentrant call: initialize only if the properties have not been set yet
             // (preserves any already-processed values written by the outer loop).
             $product->product_short_desc ??= $articleData->introtext ?? '';
-            $product->product_long_desc  ??= $articleData->fulltext  ?? '';
+            $product->product_long_desc  ??= $articleData->fulltext ?? '';
         }
 
         // Expose catid and alias at top level for routing
@@ -1401,6 +1407,44 @@ class ProductHelper
     }
 
     /**
+     * Normalise product option value IDs to the canonical order used as the variant identity key.
+     *
+     * #__j2commerce_product_variant_optionvalues.product_optionvalue_ids carries no index and no
+     * product_id column — the numerically sorted CSV is the whole contract by which a variant is
+     * resolved from a shopper's option selection. Every reader and writer of that column, core or
+     * third-party, must produce its key through here.
+     *
+     * @param   array|string  $optionvalueIds  Option value IDs, as an array or a stored CSV.
+     *
+     * @return  array  Positive integer IDs in ascending order.
+     *
+     * @since   6.0.10
+     */
+    public static function normaliseOptionvalueIds(array|string $optionvalueIds): array
+    {
+        $ids = \is_string($optionvalueIds) ? explode(',', $optionvalueIds) : $optionvalueIds;
+        $ids = array_values(array_filter(array_map('intval', $ids), static fn (int $id): bool => $id > 0));
+
+        sort($ids);
+
+        return $ids;
+    }
+
+    /**
+     * Build the exact string stored in and matched against product_optionvalue_ids.
+     *
+     * @param   array|string  $optionvalueIds  Option value IDs, as an array or a stored CSV.
+     *
+     * @return  string  Normalised CSV key.
+     *
+     * @since   6.0.10
+     */
+    public static function normaliseOptionvalueKey(array|string $optionvalueIds): string
+    {
+        return implode(',', self::normaliseOptionvalueIds($optionvalueIds));
+    }
+
+    /**
      * Get variant by selected options.
      *
      * @param   array  $productOptions  Associative array of productoption_id => optionvalue_id.
@@ -1418,14 +1462,14 @@ class ProductHelper
 
         $db = self::getDatabase();
 
-        // Build CSV of option values sorted numerically
-        $optionValues = [];
+        $optionValues = self::normaliseOptionvalueIds($productOptions);
 
-        foreach ($productOptions as $optionValue) {
-            $optionValues[] = (int) $optionValue;
+        // A selection member that is not a positive id would shorten the key and resolve a
+        // narrower combination than the shopper chose. Refuse rather than match on a subset.
+        if (\count($optionValues) !== \count($productOptions)) {
+            return null;
         }
 
-        sort($optionValues);
         $values = implode(',', $optionValues);
 
         $query = $db->getQuery(true)
@@ -1553,11 +1597,14 @@ class ProductHelper
             return '';
         }
 
-        $productOptionValues = explode(',', $csv);
-        $names               = [];
+        $ids = array_map('intval', explode(',', $csv));
 
-        foreach ($productOptionValues as $productOptionValueId) {
-            $optionValueName = self::getOptionValueName((int) $productOptionValueId);
+        self::primeOptionValueNames($ids);
+
+        $names = [];
+
+        foreach ($ids as $productOptionValueId) {
+            $optionValueName = self::$optionValueNames[$productOptionValueId] ?? '';
 
             if (empty($optionValueName)) {
                 $optionValueName = Text::_('COM_J2COMMERCE_ALL_OPTIONVALUE');
@@ -1567,6 +1614,41 @@ class ProductHelper
         }
 
         return implode(',', $names);
+    }
+
+    /** Resolves every id not already known in a single query. */
+    private static function primeOptionValueNames(array $ids): void
+    {
+        $missing = array_values(array_unique(array_filter(
+            $ids,
+            static fn (int $id): bool => $id > 0 && !\array_key_exists($id, self::$optionValueNames)
+        )));
+
+        if (empty($missing)) {
+            return;
+        }
+
+        $db    = self::getDatabase();
+        $query = $db->getQuery(true)
+            ->select([
+                $db->quoteName('pov.j2commerce_product_optionvalue_id'),
+                $db->quoteName('ov.optionvalue_name'),
+            ])
+            ->from($db->quoteName('#__j2commerce_product_optionvalues', 'pov'))
+            ->join(
+                'INNER',
+                $db->quoteName('#__j2commerce_optionvalues', 'ov') . ' ON ' .
+                $db->quoteName('pov.optionvalue_id') . ' = ' . $db->quoteName('ov.j2commerce_optionvalue_id')
+            )
+            ->whereIn($db->quoteName('pov.j2commerce_product_optionvalue_id'), $missing);
+
+        $db->setQuery($query);
+
+        $rows = $db->loadObjectList('j2commerce_product_optionvalue_id') ?: [];
+
+        foreach ($missing as $id) {
+            self::$optionValueNames[$id] = (string) ($rows[$id]->optionvalue_name ?? '');
+        }
     }
 
     /**
@@ -1580,21 +1662,13 @@ class ProductHelper
      */
     public static function getOptionValueName(int $productOptionValueId): string
     {
-        $db    = self::getDatabase();
-        $query = $db->getQuery(true)
-            ->select($db->quoteName('ov.optionvalue_name'))
-            ->from($db->quoteName('#__j2commerce_product_optionvalues', 'pov'))
-            ->join(
-                'INNER',
-                $db->quoteName('#__j2commerce_optionvalues', 'ov') . ' ON ' .
-                $db->quoteName('pov.optionvalue_id') . ' = ' . $db->quoteName('ov.j2commerce_optionvalue_id')
-            )
-            ->where($db->quoteName('pov.j2commerce_product_optionvalue_id') . ' = :povId')
-            ->bind(':povId', $productOptionValueId, ParameterType::INTEGER);
+        if ($productOptionValueId <= 0) {
+            return '';
+        }
 
-        $db->setQuery($query);
+        self::primeOptionValueNames([$productOptionValueId]);
 
-        return $db->loadResult() ?: '';
+        return self::$optionValueNames[$productOptionValueId] ?? '';
     }
 
     // =========================================================================
@@ -1866,7 +1940,8 @@ class ProductHelper
      *
      * @param   array  $options  Processed option data from getProductOptions().
      *
-     * @return  array  Associative array of productoption_id => product_optionvalue_id.
+     * @return  array  Associative array of productoption_id => product_optionvalue_id,
+     *                 or productoption_id => list of ids for multi-select checkbox options.
      *
      * @since   6.0.3
      */
@@ -1880,7 +1955,13 @@ class ProductHelper
             if (\in_array($type, ['select', 'radio', 'checkbox', 'color'])) {
                 foreach ($option['optionvalue'] as $optionValue) {
                     if (!empty($optionValue['product_optionvalue_default']) && $optionValue['product_optionvalue_default'] == 1) {
-                        $default[$option['productoption_id']] = $optionValue['product_optionvalue_id'];
+                        // A checkbox option carries every default it holds; the single-choice
+                        // types carry the one value the control can submit.
+                        if ($type === 'checkbox') {
+                            $default[$option['productoption_id']][] = $optionValue['product_optionvalue_id'];
+                        } else {
+                            $default[$option['productoption_id']] = $optionValue['product_optionvalue_id'];
+                        }
                     }
                 }
             }
@@ -2087,13 +2168,17 @@ class ProductHelper
             }
         }
 
-        // getCombinations() returns array of arrays — convert to CSV strings for comparison
-        $csvArray = array_map(fn (array $combo) => implode(',', $combo), self::getCombinations($traits));
+        // getCombinations() returns array of arrays — convert to normalised CSV keys for comparison
+        $csvArray = array_map(
+            static fn (array $combo): string => self::normaliseOptionvalueKey($combo),
+            self::getCombinations($traits)
+        );
 
         foreach ($variants as $variant) {
             // Use variant_name_ids (original CSV) if available, fall back to variant_name
-            $variantCsv = $variant->variant_name_ids ?? $variant->variant_name ?? '';
-            if (!\in_array($variantCsv, $csvArray)) {
+            $variantCsv = self::normaliseOptionvalueKey($variant->variant_name_ids ?? $variant->variant_name ?? '');
+
+            if (!\in_array($variantCsv, $csvArray, true)) {
                 return false;
             }
         }
@@ -2372,6 +2457,11 @@ class ProductHelper
      */
     public static function checkStockStatus(object $variant, int $quantity): bool
     {
+        // The owner's own switch outranks every rule below it.
+        if (InventoryHelper::isMarkedOutOfStock($variant)) {
+            return false;
+        }
+
         if (self::managingStock($variant) && !self::backordersAllowed($variant)) {
             return self::validateStock($variant, $quantity);
         }
@@ -2537,7 +2627,7 @@ class ProductHelper
         $max           = (float) ($variant->max_sale_qty ?? 0);
 
         if ($max > 0 && $quantityTotal > $max) {
-            $error = Text::sprintf('COM_J2COMMERCE_MAX_QUANTITY_FOR_PRODUCT', $max, $cartTotalQty);
+            $error = Text::sprintf('COM_J2COMMERCE_MAX_QUANTITY_FOR_PRODUCT', $max);
         }
 
         if ($min > 0 && $quantityTotal < $min) {
@@ -2725,6 +2815,11 @@ class ProductHelper
 
         if (\in_array($product->product_type, $variableTypes)) {
             return empty($product->all_sold_out);
+        }
+
+        // The owner's own switch outranks every rule below it.
+        if (InventoryHelper::isMarkedOutOfStock($product->variant)) {
+            return false;
         }
 
         // For non-variable products: if stock management is disabled, always in stock
@@ -3013,8 +3108,7 @@ class ProductHelper
             $allowDisplay = false;
         }
 
-        // TODO: Get catalog_mode from J2Commerce config when available
-        $catalogMode = 0;
+        $catalogMode = (int) $params->get('catalog_mode', 0);
 
         return $catalogMode == 0 && $allowDisplay;
     }
@@ -3777,6 +3871,11 @@ class ProductHelper
      */
     public function check_stock_status(object $variant, int $quantity): bool
     {
+        // The owner's own switch outranks every rule below it.
+        if (InventoryHelper::isMarkedOutOfStock($variant)) {
+            return false;
+        }
+
         if ($this->managing_stock($variant) && !$this->backorders_allowed($variant)) {
             return self::validateStock($variant, $quantity);
         }
@@ -4098,6 +4197,24 @@ class ProductHelper
     }
 
     /**
+     * A store set to "No Address" quotes no tax until the shopper says where the order is going.
+     *
+     * CartOrder::getCustomerGeozones() reads the same setting and skips its store-address
+     * fallback on the same terms, so the catalogue and the cart never quote different tax on
+     * the same request. Resolved once per request: the address lookup can reach the database,
+     * and displayPrice() runs on every row of a category listing.
+     */
+    private static function taxSuppressedUntilAddressKnown(): bool
+    {
+        if (self::$taxSuppressed === null) {
+            self::$taxSuppressed = ConfigHelper::getTaxDefaultAddress() === 'noaddress'
+                && (int) TaxHelper::getCustomerAddress()->country_id === 0;
+        }
+
+        return self::$taxSuppressed;
+    }
+
+    /**
      * Get tax rate for a tax profile.
      *
      * @param   int  $taxProfileId  The tax profile ID.
@@ -4108,7 +4225,7 @@ class ProductHelper
      */
     protected function getTaxRateForProfile(int $taxProfileId): float
     {
-        if ($taxProfileId <= 0) {
+        if ($taxProfileId <= 0 || self::taxSuppressedUntilAddressKnown()) {
             return 0.0;
         }
 

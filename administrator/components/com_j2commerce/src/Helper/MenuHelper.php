@@ -14,6 +14,7 @@ namespace J2Commerce\Component\J2commerce\Administrator\Helper;
 
 \defined('_JEXEC') or die;
 
+use J2Commerce\Component\J2commerce\Administrator\Model\UploadmigrationModel;
 use Joomla\CMS\Factory;
 use Joomla\CMS\Uri\Uri;
 
@@ -270,6 +271,24 @@ class MenuHelper
                 'link'  => 'index.php?option=com_j2commerce&view=queues',
                 'icon'  => 'fa-solid fa-list-check',
             ];
+
+            // Same level as the screen and the action it launches, and only on a site that
+            // still has one of the pre-6.3 upload folders — there is nothing for this screen
+            // to say anywhere else.
+            if (
+                $user->authorise('core.admin', 'com_j2commerce')
+                && array_filter(
+                    UploadmigrationModel::LEGACY_RELATIVE_PATHS,
+                    static fn (string $relative): bool => is_dir(JPATH_ROOT . '/' . $relative)
+                ) !== []
+            ) {
+                $setupChildren[] = [
+                    'title' => 'COM_J2COMMERCE_UPLOAD_MIGRATION',
+                    'view'  => 'uploadmigration',
+                    'link'  => 'index.php?option=com_j2commerce&view=uploadmigration',
+                    'icon'  => 'fa-solid fa-truck-ramp-box',
+                ];
+            }
 
             $items[] = [
                 'title'    => 'COM_J2COMMERCE_SETUP',

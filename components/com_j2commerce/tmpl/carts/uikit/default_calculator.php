@@ -290,15 +290,12 @@ document.addEventListener('DOMContentLoaded', function() {
                 // Find and replace the totals container
                 const totalsContainer = document.querySelector('.cart-totals-block');
                 if (totalsContainer) {
-                    totalsContainer.outerHTML = data.html;
+                    totalsContainer.replaceWith(J2CommerceDom.parse(data.html));
                 }
 
                 // Also replace shipping methods section if returned
                 if (data.shipping_html !== undefined) {
-                    const shippingWrapper = document.getElementById('j2commerce-cart-shipping-wrapper');
-                    if (shippingWrapper) {
-                        shippingWrapper.innerHTML = data.shipping_html;
-                    }
+                    J2CommerceDom.adopt(document.getElementById('j2commerce-cart-shipping-wrapper'), data.shipping_html);
                 }
             }
         } catch (error) {

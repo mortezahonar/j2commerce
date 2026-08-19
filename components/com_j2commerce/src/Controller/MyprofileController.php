@@ -20,6 +20,7 @@ use J2Commerce\Component\J2commerce\Administrator\Helper\CurrencyHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\CustomFieldHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\DownloadHelper;
 use J2Commerce\Component\J2commerce\Administrator\Helper\J2CommerceHelper;
+use J2Commerce\Component\J2commerce\Site\Helper\ProductVisibilityHelper;
 use Joomla\CMS\Factory;
 use Joomla\CMS\Form\Rule\PasswordRule;
 use Joomla\CMS\HTML\HTMLHelper;
@@ -296,6 +297,15 @@ class MyprofileController extends BaseController
             return;
         }
 
+        // The grant is one-way, so the configured order states are the only rule that can
+        // withdraw a file again. The listing filters on them; answer for the same rule here.
+        if (!DownloadHelper::isOrderStatusAllowed((int) $order->order_state_id)) {
+            $this->app->enqueueMessage(Text::_('COM_J2COMMERCE_MYPROFILE_DOWNLOAD_NOT_FOUND'), 'error');
+            $this->app->redirect($redirectUrl);
+
+            return;
+        }
+
         // Load download record for this order + product
         $orderId   = $order->order_id;
         $productId = (int) $productFile->product_id;
@@ -380,26 +390,38 @@ class MyprofileController extends BaseController
             return;
         }
 
-        // Increment download count on orderdownload + productfile
+        // Record the use before streaming. The database does the arithmetic and carries the
+        // limit in the same statement, so requests that overlap the read above cannot each
+        // write the same count back and record several uses as one.
         $downloadId = (int) $download->j2commerce_orderdownload_id;
-        $newCount   = (int) $download->limit_count + 1;
 
         $updateQuery = $db->getQuery(true)
             ->update($db->quoteName('#__j2commerce_orderdownloads'))
-            ->set($db->quoteName('limit_count') . ' = :newCount')
+            ->set($db->quoteName('limit_count') . ' = ' . $db->quoteName('limit_count') . ' + 1')
             ->where($db->quoteName('j2commerce_orderdownload_id') . ' = :downloadId')
-            ->bind(':newCount', $newCount, ParameterType::INTEGER)
             ->bind(':downloadId', $downloadId, ParameterType::INTEGER);
+
+        if ($downloadLimit > 0) {
+            $updateQuery->where($db->quoteName('limit_count') . ' < :downloadLimit')
+                ->bind(':downloadLimit', $downloadLimit, ParameterType::INTEGER);
+        }
+
         $db->setQuery($updateQuery);
         $db->execute();
 
-        $newTotal        = (int) $productFile->download_total + 1;
+        // Nothing updated means the limit was already spent, whoever spent it.
+        if ($downloadLimit > 0 && $db->getAffectedRows() === 0) {
+            $this->app->enqueueMessage(Text::_('COM_J2COMMERCE_MYPROFILE_DOWNLOAD_LIMIT_REACHED'), 'error');
+            $this->app->redirect($redirectUrl);
+
+            return;
+        }
+
         $pfId            = (int) $productFile->j2commerce_productfile_id;
         $updateFileQuery = $db->getQuery(true)
             ->update($db->quoteName('#__j2commerce_productfiles'))
-            ->set($db->quoteName('download_total') . ' = :newTotal')
+            ->set($db->quoteName('download_total') . ' = ' . $db->quoteName('download_total') . ' + 1')
             ->where($db->quoteName('j2commerce_productfile_id') . ' = :pfId')
-            ->bind(':newTotal', $newTotal, ParameterType::INTEGER)
             ->bind(':pfId', $pfId, ParameterType::INTEGER);
         $db->setQuery($updateFileQuery);
         $db->execute();
@@ -776,7 +798,9 @@ class MyprofileController extends BaseController
             $variantId = (int) $item->variant_id;
             $quantity  = (float) $item->orderitem_quantity;
 
-            // Validate product exists and is enabled
+            // Replaying an order of arbitrary age holds to the same predicates as the
+            // add path: enabled here, since the helper waives it for users who may edit
+            // content, and the article and category conditions the listings carry.
             $productQuery = $db->getQuery(true)
                 ->select($db->quoteName('j2commerce_product_id'))
                 ->from($db->quoteName('#__j2commerce_products'))
@@ -788,7 +812,7 @@ class MyprofileController extends BaseController
             $db->setQuery($productQuery);
             $productExists = $db->loadResult();
 
-            if (!$productExists) {
+            if (!$productExists || !ProductVisibilityHelper::isViewable($productId)) {
                 $errors[] = Text::sprintf('COM_J2COMMERCE_REORDER_PRODUCT_NOT_AVAILABLE', $item->orderitem_name);
                 continue;
             }
@@ -910,7 +934,16 @@ class MyprofileController extends BaseController
             return true;
         }
 
-        return false;
+        // A link followed out of the order email arrives in a browser that never went through
+        // checkout, so it carries none of the session above. It presents the same order token
+        // and address pair guestEntry() asks for, matched against this order's own row.
+        $requestToken = trim($this->input->getString('order_token', ''));
+        $requestEmail = trim($this->input->getString('order_email', ''));
+
+        return $requestToken !== '' && $requestEmail !== ''
+            && !empty($order->token)
+            && hash_equals((string) $order->token, $requestToken)
+            && strcasecmp((string) $order->user_email, $requestEmail) === 0;
     }
 
     private function collectFormData(): array

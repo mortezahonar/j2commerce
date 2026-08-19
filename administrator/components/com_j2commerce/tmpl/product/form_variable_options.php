@@ -12,9 +12,18 @@
 // phpcs:enable PSR1.Files.SideEffects
 
 use J2Commerce\Component\J2commerce\Administrator\Helper\J2CommerceHelper;
+use Joomla\CMS\Factory;
 use Joomla\CMS\Language\Text;
 use Joomla\CMS\Layout\LayoutHelper;
 use Joomla\CMS\Session\Session;
+
+// Adopts the option-values markup this view fetches. Deferred, so it has run before any fetch callback.
+// Drag-ordering is registered here too: the fragment is adopted as markup only, so its own asset
+// registrations and scripts never reach the page.
+Factory::getApplication()->getDocument()->getWebAssetManager()
+    ->registerAndUseScript('com_j2commerce.dom', 'media/com_j2commerce/js/site/j2commerce-dom.js', [], ['defer' => true])
+    ->registerAndUseScript('com_j2commerce.optionvalues-sortable', 'media/com_j2commerce/js/administrator/optionvalues-sortable.js', [], ['defer' => true])
+    ->registerAndUseStyle('com_j2commerce.optionvalues-sortable', 'media/com_j2commerce/css/administrator/optionvalues-sortable.css');
 
 $item        = $displayData['product'];
 $formPrefix = $displayData['form_prefix'] ?? 'jform[attribs][j2commerce]';
@@ -23,6 +32,13 @@ $formPrefix = $displayData['form_prefix'] ?? 'jform[attribs][j2commerce]';
 $textFieldDefaults = ['value' => '', 'onchange' => '', 'disabled' => false, 'readonly' => false, 'dataAttribute' => '', 'hint' => '', 'required' => false, 'autofocus' => false, 'spellcheck' => false, 'addonBefore' => '', 'addonAfter' => '', 'dirname' => '', 'charcounter' => false, 'options' => []];
 
 $productOptionList = J2CommerceHelper::product()->getProductOptionList($item->product_type);
+
+// Options already on the product are offered as disabled entries rather than omitted,
+// so the reason they cannot be picked again is visible in the list itself.
+$assignedOptionIds = array_flip(array_map(
+    static fn($poption): int => (int) $poption->option_id,
+    (array) ($item->product_options ?? [])
+));
 
 $key        = 0;
 $csrfToken  = Session::getFormToken();
@@ -106,12 +122,16 @@ $csrfToken  = Session::getFormToken();
                                         <div class="controls">
                                             <div class="input-group">
                                                 <select name="variable_option_select_id" id="j2commerce_variable_option_select" class="form-select">
-                                                    <?php foreach ($productOptionList as $option_list) : ?>
-                                                        <option value="<?php echo $option_list->j2commerce_option_id; ?>"><?php echo $this->escape($option_list->option_name) . ' (' . $this->escape($option_list->option_unique_name) . ')'; ?></option>
+                                                    <?php foreach ($productOptionList as $option_list) :
+                                                        $optionLabel = $option_list->option_name . ' (' . $option_list->option_unique_name . ')';
+                                                        $optionAssigned = isset($assignedOptionIds[(int) $option_list->j2commerce_option_id]);
+                                                        ?>
+                                                        <option value="<?php echo $option_list->j2commerce_option_id; ?>" data-option-label="<?php echo $this->escape($optionLabel); ?>"<?php echo $optionAssigned ? ' disabled' : ''; ?>><?php echo $this->escape($optionAssigned ? Text::sprintf('COM_J2COMMERCE_OPTION_LABEL_ALREADY_ADDED', $optionLabel) : $optionLabel); ?></option>
                                                     <?php endforeach; ?>
                                                 </select>
                                                 <button type="button" id="j2commerce_variable_add_option_btn" class="btn btn-primary"><?php echo Text::_('COM_J2COMMERCE_OPTIONS_ADD'); ?></button>
                                             </div>
+                                            <div id="j2commerce-variable-option-notice" class="alert alert-warning mt-2 d-none" role="alert"></div>
                                         </div>
                                     </div>
                                 <?php endif; ?>
@@ -191,6 +211,59 @@ document.addEventListener('DOMContentLoaded', () => {
     const productId = <?php echo (int) ($item->j2commerce_product_id ?? 0); ?>;
     const csrfToken = '<?php echo $csrfToken; ?>';
     const variantTypes = ['select', 'radio', 'checkbox', 'color'];
+    const optionSelect = document.getElementById('j2commerce_variable_option_select');
+    const optionNotice = document.getElementById('j2commerce-variable-option-notice');
+    const addOptionBtn = document.getElementById('j2commerce_variable_add_option_btn');
+    const addedLabelFormat = <?php echo json_encode(Text::_('COM_J2COMMERCE_OPTION_LABEL_ALREADY_ADDED')); ?>;
+
+    // Feedback belongs beside the control that produced it — the options block sits far
+    // enough down the form that the page-top message container is off screen.
+    function showOptionNotice(message) {
+        if (!optionNotice) return;
+        optionNotice.textContent = message;
+        optionNotice.classList.remove('d-none');
+    }
+
+    function clearOptionNotice() {
+        if (!optionNotice) return;
+        optionNotice.textContent = '';
+        optionNotice.classList.add('d-none');
+    }
+
+    function selectedOptionEl() {
+        return optionSelect && optionSelect.selectedIndex >= 0
+            ? optionSelect.options[optionSelect.selectedIndex]
+            : null;
+    }
+
+    // The table is the single source of truth for what is on the product, so the dropdown
+    // is derived from it after every change rather than toggled entry by entry.
+    function syncOptionSelect() {
+        if (!optionSelect) return;
+
+        const usedIds = new Set(
+            Array.from(document.querySelectorAll('#variable_options_table input[name$="[option_id]"]'))
+                .map(input => input.value)
+        );
+
+        Array.from(optionSelect.options).forEach(option => {
+            const label = option.dataset.optionLabel || option.textContent;
+            const isUsed = usedIds.has(option.value);
+            option.disabled = isUsed;
+            // Function replacement so a '$' in an option name is not read as a substitution.
+            option.textContent = isUsed ? addedLabelFormat.replace('%s', () => label) : label;
+        });
+
+        const firstAvailable = Array.from(optionSelect.options).find(option => !option.disabled);
+        if (firstAvailable && (selectedOptionEl() === null || selectedOptionEl().disabled)) {
+            optionSelect.value = firstAvailable.value;
+        }
+        if (addOptionBtn) {
+            addOptionBtn.disabled = !firstAvailable;
+        }
+    }
+
+    syncOptionSelect();
 
 
     // Returns the row element itself, so the caller inserts it directly.
@@ -211,21 +284,23 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const nameCell = document.createElement('td');
 
+        // Mirrors the server-rendered row above: name in a flex line, type on its own line.
+        // A row added here has to survive a reload without changing shape.
+        const nameLine = document.createElement('div');
+        nameLine.className = 'd-flex align-items-center';
+
+        const nameLabel = document.createElement('strong');
+        nameLabel.textContent = optionName;
+
         const uniqueLabel = document.createElement('small');
+        uniqueLabel.className = 'ms-1';
         uniqueLabel.textContent = '(' + uniqueName + ')';
 
-        const typeLabel = document.createElement('small');
-        typeLabel.className = 'text-capitalize';
-        typeLabel.textContent = <?php echo json_encode(Text::_('COM_J2COMMERCE_OPTION_TYPE')); ?> + ' ' + optionType;
-
-        nameCell.append(
-            optionName,
+        nameLine.append(
+            nameLabel,
             hidden('j2commerce_productoption_id', poId),
             hidden('option_id', optionId),
-            ' ',
-            uniqueLabel,
-            ' ',
-            typeLabel
+            uniqueLabel
         );
 
         if (variantTypes.includes(optionType)) {
@@ -237,11 +312,19 @@ document.addEventListener('DOMContentLoaded', () => {
             setValuesButton.dataset.optionName = optionName;
 
             const cogIcon = document.createElement('span');
-            cogIcon.className = 'icon-cog';
-            setValuesButton.append(cogIcon, ' ' + <?php echo json_encode(Text::_('COM_J2COMMERCE_OPTION_SET_VALUES')); ?>);
+            cogIcon.className = 'icon-cog me-1';
+            setValuesButton.append(cogIcon, <?php echo json_encode(Text::_('COM_J2COMMERCE_OPTION_SET_VALUES')); ?>);
 
-            nameCell.append(' ', setValuesButton);
+            nameLine.append(setValuesButton);
         }
+
+        const typeLine = document.createElement('div');
+        const typeLabel = document.createElement('small');
+        typeLabel.className = 'text-capitalize';
+        typeLabel.textContent = <?php echo json_encode(Text::_('COM_J2COMMERCE_OPTION_TYPE')); ?> + ': ' + optionType;
+        typeLine.append(typeLabel);
+
+        nameCell.append(nameLine, typeLine);
 
         const orderingCell = document.createElement('td');
         const orderingInput = document.createElement('input');
@@ -271,15 +354,14 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // AJAX Add option button handler
-    const addOptionBtn = document.getElementById('j2commerce_variable_add_option_btn');
     if (addOptionBtn) {
         addOptionBtn.addEventListener('click', async () => {
-            const selectEl = document.getElementById('j2commerce_variable_option_select');
-            if (!selectEl) return;
+            if (!optionSelect) return;
 
-            const optionId = selectEl.value;
+            const optionId = optionSelect.value;
             if (!optionId) return;
 
+            clearOptionNotice();
             addOptionBtn.disabled = true;
             setSpinnerOnly(addOptionBtn, <?php echo json_encode(Text::_('COM_J2COMMERCE_LOADING')); ?>);
 
@@ -308,15 +390,17 @@ document.addEventListener('DOMContentLoaded', () => {
                         insertBeforeRow.parentNode.insertBefore(newRow, insertBeforeRow);
                     }
                 } else {
-                    Joomla.renderMessages({warning: [data.message || <?php echo json_encode(Text::_('COM_J2COMMERCE_ERROR_OCCURRED')); ?>]});
+                    // The server rejects a duplicate on its own; surface that beside the control.
+                    showOptionNotice(data.message || <?php echo json_encode(Text::_('COM_J2COMMERCE_ERROR_OCCURRED')); ?>);
                 }
             } catch (error) {
                 console.error('Error adding option:', error);
-                Joomla.renderMessages({error: [<?php echo json_encode(Text::_('COM_J2COMMERCE_ERROR_OCCURRED')); ?>]});
+                showOptionNotice(<?php echo json_encode(Text::_('COM_J2COMMERCE_ERROR_OCCURRED')); ?>);
             }
 
-            addOptionBtn.disabled = false;
             addOptionBtn.textContent = <?php echo json_encode(Text::_('COM_J2COMMERCE_OPTIONS_ADD')); ?>;
+            addOptionBtn.disabled = false;
+            syncOptionSelect();
         });
     }
 
@@ -332,6 +416,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const optionId = removeBtn.getAttribute('data-option-id');
         if (!optionId) {
             row.remove();
+            clearOptionNotice();
+            syncOptionSelect();
             return;
         }
 
@@ -350,9 +436,15 @@ document.addEventListener('DOMContentLoaded', () => {
             if (data.success) {
                 row.style.transition = 'opacity 0.3s';
                 row.style.opacity = '0';
-                setTimeout(() => row.remove(), 300);
+                setTimeout(() => {
+                    row.remove();
+                    // Re-offer the option only once the row is really gone, so the dropdown
+                    // and the server's own duplicate check never disagree during the fade.
+                    clearOptionNotice();
+                    syncOptionSelect();
+                }, 300);
             } else {
-                Joomla.renderMessages({warning: [data.message || <?php echo json_encode(Text::_('COM_J2COMMERCE_ERROR_OCCURRED')); ?>]});
+                showOptionNotice(data.message || <?php echo json_encode(Text::_('COM_J2COMMERCE_ERROR_OCCURRED')); ?>);
                 setIconLabel(removeBtn, 'icon icon-trash');
             }
         } catch (error) {
@@ -417,7 +509,7 @@ document.addEventListener('DOMContentLoaded', () => {
             dismissButton.type = 'button';
             dismissButton.className = 'btn-close';
             dismissButton.setAttribute('data-bs-dismiss', 'alert');
-            dismissButton.setAttribute('aria-label', 'Close');
+            dismissButton.setAttribute('aria-label', <?php echo json_encode(Text::_('JCLOSE')); ?>);
             alertBox.append(dismissButton);
 
             messagesContainer.replaceChildren(alertBox);
@@ -445,7 +537,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const data = await response.json();
 
             if (data.success) {
-                optionValuesModalBody.innerHTML = data.html;
+                J2CommerceDom.adopt(optionValuesModalBody, data.html);
                 modalLabel.textContent = <?php echo json_encode(Text::_('COM_J2COMMERCE_PAO_SET_OPTIONS_FOR')); ?> + ': ' + data.optionName;
                 initOptionValuesHandlers();
             } else {
@@ -464,6 +556,9 @@ document.addEventListener('DOMContentLoaded', () => {
         const containerProductId = container.dataset.productId;
         const containerProductOptionId = container.dataset.productoptionId;
 
+        // The tbody is replaced on every load, so the hidden ordering inputs are restamped here.
+        window.J2CommerceOptionValuesSortable?.renumber();
+
         // Create option value
         const createBtn = document.getElementById('j2commerce-create-optionvalue-btn');
         if (createBtn) {
@@ -481,7 +576,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 formData.append('product_optionvalue_prefix', document.getElementById('j2commerce_new_price_prefix')?.value || '+');
                 formData.append('product_optionvalue_weight', document.getElementById('j2commerce_new_weight')?.value || '0');
                 formData.append('product_optionvalue_weight_prefix', document.getElementById('j2commerce_new_weight_prefix')?.value || '+');
-                formData.append('ordering', document.getElementById('j2commerce_new_ordering')?.value || '0');
+                // Drag position owns ordering, so a new value lands after the ones already listed.
+                formData.append('ordering', window.J2CommerceOptionValuesSortable?.count() ?? 0);
                 formData.append('product_optionvalue_attribs', document.getElementById('j2commerce_new_attribs')?.value || '');
                 formData.append(csrfToken, 1);
 
@@ -640,15 +736,25 @@ document.addEventListener('DOMContentLoaded', () => {
             });
         });
 
-        // Set default option value
+        // Paint one star from the state the server just confirmed.
+        const applyDefaultState = (button, isDefault) => {
+            button.dataset.isDefault = isDefault ? '1' : '0';
+            button.classList.toggle('text-warning', isDefault);
+            button.classList.toggle('text-body-secondary', !isDefault);
+            button.title = isDefault ? <?php echo json_encode(Text::_('COM_J2COMMERCE_UNSET_DEFAULT')); ?> : <?php echo json_encode(Text::_('COM_J2COMMERCE_SET_AS_DEFAULT')); ?>;
+            const icon = button.querySelector('span');
+            if (icon) icon.className = isDefault ? 'icon-star' : 'icon-star-empty';
+        };
+
         document.querySelectorAll('.j2commerce-set-default-btn').forEach(btn => {
             btn.addEventListener('click', async () => {
                 const povId = btn.dataset.povId;
+                const wasDefault = btn.dataset.isDefault === '1';
                 btn.disabled = true;
 
                 const formData = new FormData();
                 formData.append('option', 'com_j2commerce');
-                formData.append('task', 'products.setDefault');
+                formData.append('task', wasDefault ? 'products.unsetDefault' : 'products.setDefault');
                 formData.append('product_id', containerProductId);
                 formData.append('productoption_id', containerProductOptionId);
                 formData.append('cid[]', povId);
@@ -659,22 +765,20 @@ document.addEventListener('DOMContentLoaded', () => {
                     const data = await response.json();
 
                     if (data.success) {
-                        document.querySelectorAll('.j2commerce-set-default-btn').forEach(b => {
-                            b.classList.remove('text-warning');
-                            b.classList.add('text-body-secondary');
-                            const icon = b.querySelector('span');
-                            if (icon) icon.className = 'icon-star-empty';
-                        });
-                        btn.classList.remove('text-body-secondary');
-                        btn.classList.add('text-warning');
-                        const selectedIcon = btn.querySelector('span');
-                        if (selectedIcon) selectedIcon.className = 'icon-star';
-                        showModalMessage(<?php echo json_encode(Text::_('COM_J2COMMERCE_DEFAULT_SET_SUCCESSFULLY')); ?>, 'success');
+                        // A single-choice option carries one default, so the star this
+                        // click claimed was released from whichever value held it.
+                        if (data.is_default && data.exclusive) {
+                            document.querySelectorAll('.j2commerce-set-default-btn').forEach(b => applyDefaultState(b, false));
+                        }
+                        applyDefaultState(btn, !!data.is_default);
+                        if (data.is_default) {
+                            showModalMessage(<?php echo json_encode(Text::_('COM_J2COMMERCE_DEFAULT_SET_SUCCESSFULLY')); ?>, 'success');
+                        }
                     } else {
                         showModalMessage(data.message || <?php echo json_encode(Text::_('COM_J2COMMERCE_ERROR_OCCURRED')); ?>, 'danger');
                     }
                 } catch (error) {
-                    console.error('Error setting default:', error);
+                    console.error('Error changing default:', error);
                     showModalMessage(<?php echo json_encode(Text::_('COM_J2COMMERCE_ERROR_OCCURRED')); ?>, 'danger');
                 }
 

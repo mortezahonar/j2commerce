@@ -577,7 +577,8 @@ class StrapperHelper
             $wa      = Factory::getApplication()->getDocument()->getWebAssetManager();
             $context = $forceContext ?? $this->getViewContext();
 
-            $wa->registerAndUseScript('com_j2commerce.site', 'media/com_j2commerce/js/site/j2commerce.js', [], ['defer' => true]);
+            $wa->registerAndUseScript('com_j2commerce.dom', 'media/com_j2commerce/js/site/j2commerce-dom.js', [], ['defer' => true]);
+            $wa->registerAndUseScript('com_j2commerce.site', 'media/com_j2commerce/js/site/j2commerce.js', [], ['defer' => true], ['com_j2commerce.dom']);
             $wa->registerAndUseScript('com_j2commerce.a11y', 'media/com_j2commerce/js/site/j2commerce-a11y.js', [], ['defer' => true]);
             $wa->registerAndUseScript('plg_j2commerce_app_flexivariable.flexivariable', 'media/plg_j2commerce_app_flexivariable/js/flexivariable.js', [], ['defer' => true]);
 
@@ -622,6 +623,10 @@ class StrapperHelper
         // Drag & drop / hero-banner upload widgets for product options.
         $wa->registerAndUseStyle('com_j2commerce.option-upload-fields', 'media/com_j2commerce/css/site/option-upload-fields.css');
         $wa->registerAndUseScript('com_j2commerce.option-upload-fields', 'media/com_j2commerce/js/site/option-upload-fields.js', [], ['defer' => true]);
+
+        if ($this->stickyColumnsEnabled()) {
+            $wa->registerAndUseScript('com_j2commerce.product-sticky-columns', 'media/com_j2commerce/js/site/product-sticky-columns.js', [], ['defer' => true]);
+        }
 
         \Joomla\CMS\Language\Text::script('COM_J2COMMERCE_LOADING');
         \Joomla\CMS\Language\Text::script('COM_J2COMMERCE_UPLOAD_ERR_GENERIC_ERROR');
@@ -825,6 +830,16 @@ class StrapperHelper
         if ($loadSwiper) {
             $wa->registerAndUseStyle('com_j2commerce.vendor.swiper.css', 'media/com_j2commerce/vendor/swiper/css/swiper-bundle.min.css');
         }
+
+        if ($this->stickyColumnsEnabled()) {
+            $wa->registerAndUseStyle('com_j2commerce.product-sticky-columns', 'media/com_j2commerce/css/site/product-sticky-columns.css');
+        }
+    }
+
+    /** Menu parameter, so it comes from the merged active-menu params the detail layouts read. */
+    protected function stickyColumnsEnabled(): bool
+    {
+        return (int) Factory::getApplication()->getParams()->get('item_sticky_columns', 0) === 1;
     }
 
     /**
@@ -990,7 +1005,8 @@ class StrapperHelper
         try {
             $wa = Factory::getApplication()->getDocument()->getWebAssetManager();
 
-            $wa->registerAndUseScript('com_j2commerce.site', 'media/com_j2commerce/js/site/j2commerce.js', [], ['defer' => true]);
+            $wa->registerAndUseScript('com_j2commerce.dom', 'media/com_j2commerce/js/site/j2commerce-dom.js', [], ['defer' => true]);
+            $wa->registerAndUseScript('com_j2commerce.site', 'media/com_j2commerce/js/site/j2commerce.js', [], ['defer' => true], ['com_j2commerce.dom']);
             $wa->registerAndUseScript('com_j2commerce.a11y', 'media/com_j2commerce/js/site/j2commerce-a11y.js', [], ['defer' => true]);
 
             // Load core CSS (handles template overrides)

@@ -23,6 +23,9 @@ const J2Commerce = {
         this.initColorOptionLabels();
         this.initRadioOptionLabels();
         this.initShippingSameAsBilling();
+        // Server-rendered checkbox options need the same binding the swapped-in
+        // child containers get, or a listing card's boxes answer to nothing.
+        this.initConfigCheckboxes(document);
         this.initConfigurableDefaults();
         this.initVariantDeepLink();
         this.equalizeHeights();
@@ -101,10 +104,18 @@ const J2Commerce = {
             });
             const json = await response.json();
 
-            if (!json) return;
+            if (!json) {
+                button.classList.remove('loading');
+                return;
+            }
 
             if (json.error) {
-                window.location = json.product_url;
+                if (json.product_redirect) {
+                    window.location = json.product_redirect;
+                    return;
+                }
+
+                button.classList.remove('loading');
                 return;
             }
 
@@ -120,6 +131,12 @@ const J2Commerce = {
             if (json.redirect) {
                 window.location.href = json.redirect;
                 return;
+            }
+
+            // Same unrecognised failure shape as addToCartForm() — without this the
+            // spinner keeps running on a button the shopper can still click.
+            if (!json.success) {
+                button.classList.remove('loading');
             }
         } catch (error) {
             console.error('Cart error:', error);
@@ -224,6 +241,24 @@ const J2Commerce = {
             if (json.redirect) {
                 window.location.href = json.redirect;
                 return;
+            }
+
+            // A failure that carries neither `error` nor `success` (a token mismatch, a
+            // missing cart, an unhandled product type) would otherwise leave the button
+            // stuck on its "adding" label with nothing on screen to explain why.
+            if (!json.success) {
+                if (submitBtn) {
+                    if (submitBtn.tagName === 'BUTTON') submitBtn.textContent = actionDone;
+                    else submitBtn.value = actionDone;
+                }
+
+                const notifications = form.querySelector('.j2commerce-notifications');
+                if (notifications && typeof json.message === 'string' && json.message) {
+                    const failure = document.createElement('span');
+                    failure.className = 'j2error';
+                    failure.textContent = json.message;
+                    notifications.replaceChildren(failure);
+                }
             }
         } catch (error) {
             console.error('Cart form error:', error);
@@ -413,7 +448,7 @@ const J2Commerce = {
         // Convert FormData to object, excluding task and view
         for (const [key, value] of formData.entries()) {
             if (key !== 'task' && key !== 'view') {
-                values[key] = value;
+                this.collectValue(values, key, value);
             }
         }
         values.product_id = productId;
@@ -453,7 +488,7 @@ const J2Commerce = {
             element.appendChild(wait);
         }
 
-        const params = new URLSearchParams(values);
+        const params = this.buildParams(values);
         const url = `${this.baseUrl}index.php?option=com_j2commerce&view=product&task=product.update&po_id=${poId}&pov_id=${povId}&product_id=${productId}`;
 
         try {
@@ -512,10 +547,10 @@ const J2Commerce = {
             && matchMedia('(prefers-reduced-motion: reduce)').matches;
     },
 
-    // Parse server-rendered option HTML into an inert fragment (no innerHTML, no script
-    // execution; inline onchange attributes are preserved as the child layout expects).
+    // Parse server-rendered option HTML into an inert fragment. Scripts are dropped and
+    // inline onchange attributes preserved, which is what the child layout expects.
     parseHtmlFragment(html) {
-        return document.createRange().createContextualFragment(html);
+        return J2CommerceDom.parse(html);
     },
 
     // Mark a child-options container as loading without shifting layout: hold its current
@@ -748,6 +783,46 @@ const J2Commerce = {
         return base + (query ? '?' + query : '') + hash;
     },
 
+    // Record one form entry. A multi-select control (a checkbox option) submits
+    // the same name once per selected value, so the repeats are kept as a list
+    // rather than each one displacing the one before it.
+    collectValue(values, key, value) {
+        if (!(key in values)) {
+            values[key] = value;
+            return;
+        }
+
+        values[key] = Array.isArray(values[key]) ? [...values[key], value] : [values[key], value];
+    },
+
+    // Turn the collected form entries into a query string, emitting one pair per
+    // value so a list arrives at the server as the list it was. The session token
+    // is a form field rather than a parameter of this request, so it is left out
+    // the same way task and view are.
+    buildParams(values) {
+        const params = new URLSearchParams();
+
+        Object.entries(values).forEach(([key, value]) => {
+            if (this.isSessionToken(key)) {
+                return;
+            }
+
+            if (Array.isArray(value)) {
+                value.forEach(entry => params.append(key, entry));
+            } else {
+                params.append(key, value);
+            }
+        });
+
+        return params;
+    },
+
+    // Joomla names the session token field after the token itself, so it is the
+    // 32-character hexadecimal name carrying a value of 1.
+    isSessionToken(key) {
+        return /^[0-9a-f]{32}$/.test(key);
+    },
+
     /**
      * Handle AJAX price update
      * @param {number} productId - Product ID
@@ -768,7 +843,7 @@ const J2Commerce = {
 
         for (const [key, value] of formData.entries()) {
             if (key !== 'task' && key !== 'view') {
-                values[key] = value;
+                this.collectValue(values, key, value);
             }
         }
         values.product_id = productId;
@@ -811,7 +886,7 @@ const J2Commerce = {
         const notifications = document.querySelector('.j2commerce-notifications .j2error');
         if (notifications) notifications.replaceChildren();
 
-        const params = new URLSearchParams(values);
+        const params = this.buildParams(values);
         if (!this.baseUrl) this.baseUrl = this.getBaseUrl();
         const url = `${this.baseUrl}index.php?option=com_j2commerce&view=product&task=product.update`;
 
@@ -1112,7 +1187,7 @@ const J2Commerce = {
     },
 
     restoreOriginalGallery(mainEl, thumbsEl, enableZoom) {
-        const originalMain = mainEl.dataset.originalSlides;
+        const originalMain = mainEl._originalSlides ?? mainEl.dataset.originalSlides;
         if (!originalMain) return;
 
         const mainSwiper = mainEl._swiper;
@@ -1121,9 +1196,11 @@ const J2Commerce = {
         if (mainSwiper) mainSwiper.destroy(true, true);
         if (thumbSwiper) thumbSwiper.destroy(true, true);
 
-        mainEl.querySelector('.swiper-wrapper').replaceChildren(this.parseHtmlFragment(originalMain));
-        if (thumbsEl?.dataset.originalSlides) {
-            thumbsEl.querySelector('.swiper-wrapper').replaceChildren(this.parseHtmlFragment(thumbsEl.dataset.originalSlides));
+        mainEl.querySelector('.swiper-wrapper').replaceChildren(this.cloneOriginalSlides(originalMain));
+
+        const originalThumbs = thumbsEl && (thumbsEl._originalSlides ?? thumbsEl.dataset.originalSlides);
+        if (originalThumbs) {
+            thumbsEl.querySelector('.swiper-wrapper').replaceChildren(this.cloneOriginalSlides(originalThumbs));
         }
 
         const slideCount = mainEl.querySelectorAll('.swiper-slide').length;
@@ -1134,6 +1211,16 @@ const J2Commerce = {
         if (thumbsEl) thumbsEl.style.display = slideCount > 1 ? '' : 'none';
 
         this.reinitSwipers(mainEl, thumbsEl, enableZoom);
+    },
+
+    /** String branch serves template overrides still snapshotting into data-original-slides. */
+    cloneOriginalSlides(original) {
+        if (typeof original === 'string') return this.parseHtmlFragment(original);
+
+        const fragment = document.createDocumentFragment();
+        Array.from(original.children).forEach(node => fragment.appendChild(node.cloneNode(true)));
+
+        return fragment;
     },
 
     reinitSwipers(mainEl, thumbsEl, enableZoom) {
